@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
 
 /* Nimbus UI widgets reimplemented on Catastrophe (replaces PakKit). */
 #define NIMBUS_UI_IMPLEMENTATION
@@ -232,7 +233,11 @@ static void format_hour_label(const char *time_str, char *out, size_t out_size) 
  * ----------------------------------------------------------------------- */
 
 static int check_wifi(void) {
+#ifdef PLATFORM_MAC
+    return 1; /* desktop dev build has no wifi-strength backend; assume online */
+#else
     return cat__get_wifi_strength() > 0;
+#endif
 }
 
 /* -----------------------------------------------------------------------
@@ -526,45 +531,6 @@ static int fetch_url(const char *url, fetch_buf_t *buf) {
  * Icon fetch + cache
  * ----------------------------------------------------------------------- */
 
-static SDL_Texture *fetch_and_load_icon(const char *icon_url) {
-    if (!icon_url || !icon_url[0] || g_cache_dir[0] == '\0') return NULL;
-    char full_url[MAX_URL];
-    if (strncmp(icon_url, "//", 2) == 0)
-        snprintf(full_url, sizeof(full_url), "https:%s", icon_url);
-    else
-        snprintf(full_url, sizeof(full_url), "%s", icon_url);
-    const char *slash = strrchr(icon_url, '/');
-    const char *fname = slash ? slash + 1 : "icon.png";
-    const char *day_night = strstr(icon_url, "/day/") ? "day" : "night";
-    char cache_path[MAX_PATH_LEN];
-    snprintf(cache_path, sizeof(cache_path), "%s/%s_%s", g_cache_dir, day_night, fname);
-    if (access(cache_path, R_OK) == 0)
-        return cat_load_image(cache_path);
-    fetch_buf_t buf;
-    int rc = fetch_url(full_url, &buf);
-    if (rc != 0 || !buf.data) return NULL;
-    FILE *f = fopen(cache_path, "wb");
-    if (f) { fwrite(buf.data, 1, buf.size, f); fclose(f); }
-    free(buf.data);
-    return cat_load_image(cache_path);
-}
-
-static SDL_Texture *load_cached_icon(const char *icon_url) {
-    if (!icon_url || !icon_url[0] || g_cache_dir[0] == '\0') return NULL;
-    const char *slash = strrchr(icon_url, '/');
-    const char *fname = slash ? slash + 1 : "icon.png";
-    const char *day_night = strstr(icon_url, "/day/") ? "day" : "night";
-    char cache_path[MAX_PATH_LEN];
-    snprintf(cache_path, sizeof(cache_path), "%s/%s_%s", g_cache_dir, day_night, fname);
-    if (access(cache_path, R_OK) == 0)
-        return cat_load_image(cache_path);
-    return NULL;
-}
-
-/* -----------------------------------------------------------------------
- * WeatherAPI.com: fetch + parse
- * ----------------------------------------------------------------------- */
-
 static void free_weather_textures(weather_data_t *w) {
     if (w->icon_texture) { SDL_DestroyTexture(w->icon_texture); w->icon_texture = NULL; }
     for (int i = 0; i < w->forecast_count; i++) {
@@ -581,217 +547,204 @@ static void free_weather_textures(weather_data_t *w) {
     }
 }
 
-static int parse_weather_data(const char *json_str, weather_data_t *weather) {
-    free_weather_textures(weather);
-    memset(weather, 0, sizeof(*weather));
+/* -----------------------------------------------------------------------
+ * Open-Meteo backend (keyless): unit/format helpers, WMO codes, moon phase,
+ * IP geolocation for the default location, and the forecast JSON parser.
+ * ----------------------------------------------------------------------- */
 
+static double c2f(double c)     { return c * 9.0 / 5.0 + 32.0; }
+static double kmh2mph(double k) { return k * 0.621371; }
+static double mm2in(double m)   { return m * 0.0393701; }
+
+/* WMO weather interpretation code -> short label. */
+static const char *wmo_text(int code) {
+    switch (code) {
+        case 0:  return "Clear";
+        case 1:  return "Mainly clear";
+        case 2:  return "Partly cloudy";
+        case 3:  return "Overcast";
+        case 45: case 48: return "Fog";
+        case 51: case 53: case 55: return "Drizzle";
+        case 56: case 57: return "Freezing drizzle";
+        case 61: case 63: case 65: return "Rain";
+        case 66: case 67: return "Freezing rain";
+        case 71: case 73: case 75: return "Snow";
+        case 77: return "Snow grains";
+        case 80: case 81: case 82: return "Rain showers";
+        case 85: case 86: return "Snow showers";
+        case 95: return "Thunderstorm";
+        case 96: case 99: return "Thunderstorm, hail";
+        default: return "\xe2\x80\x94"; /* em dash */
+    }
+}
+
+static void deg_to_compass(double deg, char *out, size_t n) {
+    static const char *dirs[] = {"N","NNE","NE","ENE","E","ESE","SE","SSE",
+                                 "S","SSW","SW","WSW","W","WNW","NW","NNW"};
+    int idx = (int)((deg + 11.25) / 22.5) & 15;
+    snprintf(out, n, "%s", dirs[idx]);
+}
+
+/* Extract "HH:MM" from an ISO time like "2024-01-15T06:30". */
+static void iso_hhmm(const char *iso, char *out, size_t n) {
+    const char *t = strchr(iso, 'T');
+    if (t && strlen(t) >= 6) snprintf(out, n, "%.5s", t + 1);
+    else out[0] = '\0';
+}
+
+/* Moon phase + illumination for a Y-M-D date (synodic-month approximation,
+   +/- ~1 day). Open-Meteo doesn't provide moon data, so we compute it. */
+static void compute_moon_phase(int y, int m, int d, char *out, size_t n, int *illum) {
+    long a = (14 - m) / 12;
+    long yy = y + 4800 - a;
+    long mm = m + 12 * a - 3;
+    long jdn = d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+    double age = fmod((double)jdn - 2451550.1, 29.530588853);
+    if (age < 0) age += 29.530588853;
+    double frac = age / 29.530588853;            /* 0..1 through the cycle */
+    if (illum) *illum = (int)((1.0 - cos(2.0 * M_PI * frac)) / 2.0 * 100.0 + 0.5);
+    const char *name =
+        frac < 0.0625 ? "New Moon"        : frac < 0.1875 ? "Waxing Crescent" :
+        frac < 0.3125 ? "First Quarter"   : frac < 0.4375 ? "Waxing Gibbous"  :
+        frac < 0.5625 ? "Full Moon"       : frac < 0.6875 ? "Waning Gibbous"  :
+        frac < 0.8125 ? "Last Quarter"    : frac < 0.9375 ? "Waning Crescent" : "New Moon";
+    snprintf(out, n, "%s", name);
+}
+
+/* Keyless IP geolocation (ip-api.com) for the "auto:ip" default location. */
+static int ip_geolocate(double *lat, double *lon, char *city, size_t city_n,
+                        char *region, size_t region_n) {
+    fetch_buf_t buf;
+    if (fetch_url("http://ip-api.com/json/?fields=status,lat,lon,city,regionName", &buf) != 0)
+        return -1;
+    cJSON *root = cJSON_Parse(buf.data);
+    free(buf.data);
+    if (!root) return -1;
+    int rc = -1;
+    cJSON *st = cJSON_GetObjectItem(root, "status");
+    if (st && cJSON_IsString(st) && strcmp(st->valuestring, "success") == 0) {
+        cJSON *la = cJSON_GetObjectItem(root, "lat");
+        cJSON *lo = cJSON_GetObjectItem(root, "lon");
+        cJSON *ci = cJSON_GetObjectItem(root, "city");
+        cJSON *re = cJSON_GetObjectItem(root, "regionName");
+        if (la && lo) {
+            *lat = la->valuedouble; *lon = lo->valuedouble;
+            if (ci && cJSON_IsString(ci) && city)   snprintf(city, city_n, "%s", ci->valuestring);
+            if (re && cJSON_IsString(re) && region) snprintf(region, region_n, "%s", re->valuestring);
+            rc = 0;
+        }
+    }
+    cJSON_Delete(root);
+    return rc;
+}
+
+static double arr_num(cJSON *arr, int i) {
+    cJSON *it = cJSON_GetArrayItem(arr, i);
+    return (it && cJSON_IsNumber(it)) ? it->valuedouble : 0.0;
+}
+static const char *arr_str(cJSON *arr, int i) {
+    cJSON *it = cJSON_GetArrayItem(arr, i);
+    return (it && cJSON_IsString(it)) ? it->valuestring : "";
+}
+static double obj_num(cJSON *o, const char *k) {
+    cJSON *it = o ? cJSON_GetObjectItem(o, k) : NULL;
+    return (it && cJSON_IsNumber(it)) ? it->valuedouble : 0.0;
+}
+
+/* Parse an Open-Meteo /v1/forecast response into weather. The caller sets the
+   display name afterward (Open-Meteo doesn't return one). */
+static int parse_weather_data(const char *json_str, weather_data_t *weather) {
     cJSON *root = cJSON_Parse(json_str);
     if (!root) return -1;
-
-    cJSON *error = cJSON_GetObjectItem(root, "error");
-    if (error) { cJSON_Delete(root); return -1; }
-
-    cJSON *loc = cJSON_GetObjectItem(root, "location");
-    if (loc) {
-        cJSON *v;
-        if ((v = cJSON_GetObjectItem(loc, "name")) && v->valuestring)
-            strncpy(weather->location_name, v->valuestring, MAX_LOCATION - 1);
-        if ((v = cJSON_GetObjectItem(loc, "region")) && v->valuestring)
-            strncpy(weather->region, v->valuestring, MAX_LOCATION - 1);
-        if ((v = cJSON_GetObjectItem(loc, "country")) && v->valuestring)
-            strncpy(weather->country, v->valuestring, MAX_LOCATION - 1);
-        if ((v = cJSON_GetObjectItem(loc, "lat"))) weather->loc_lat = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(loc, "lon"))) weather->loc_lon = v->valuedouble;
-    }
+    memset(weather, 0, sizeof(*weather));
+    weather->loc_lat = obj_num(root, "latitude");
+    weather->loc_lon = obj_num(root, "longitude");
 
     cJSON *cur = cJSON_GetObjectItem(root, "current");
     if (cur) {
-        cJSON *v;
-        if ((v = cJSON_GetObjectItem(cur, "temp_f")))       weather->temp_f = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "temp_c")))       weather->temp_c = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "feelslike_f")))   weather->feels_like_f = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "feelslike_c")))   weather->feels_like_c = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "humidity")))      weather->humidity = v->valueint;
-        if ((v = cJSON_GetObjectItem(cur, "wind_mph")))      weather->wind_mph = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "wind_kph")))      weather->wind_kph = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "wind_dir")) && v->valuestring)
-            strncpy(weather->wind_dir, v->valuestring, sizeof(weather->wind_dir) - 1);
-        if ((v = cJSON_GetObjectItem(cur, "precip_in")))     weather->precip_in = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "precip_mm")))     weather->precip_mm = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "cloud")))         weather->cloud = v->valueint;
-        if ((v = cJSON_GetObjectItem(cur, "uv")))            weather->uv = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(cur, "is_day")))        weather->is_day = v->valueint;
-        if ((v = cJSON_GetObjectItem(cur, "last_updated")) && v->valuestring)
-            strncpy(weather->last_updated, v->valuestring, sizeof(weather->last_updated) - 1);
-        cJSON *cond = cJSON_GetObjectItem(cur, "condition");
-        if (cond) {
-            if ((v = cJSON_GetObjectItem(cond, "text")) && v->valuestring)
-                strncpy(weather->condition_text, v->valuestring, MAX_LABEL - 1);
-            if ((v = cJSON_GetObjectItem(cond, "code")))
-                weather->condition_code = v->valueint;
-            if ((v = cJSON_GetObjectItem(cond, "icon")) && v->valuestring)
-                strncpy(weather->icon_url, v->valuestring, MAX_URL - 1);
-        }
+        weather->temp_c       = obj_num(cur, "temperature_2m");
+        weather->feels_like_c = obj_num(cur, "apparent_temperature");
+        weather->humidity     = (int)obj_num(cur, "relative_humidity_2m");
+        weather->is_day       = (int)obj_num(cur, "is_day");
+        weather->precip_mm    = obj_num(cur, "precipitation");
+        weather->cloud        = (int)obj_num(cur, "cloud_cover");
+        weather->wind_kph     = obj_num(cur, "wind_speed_10m");
+        weather->uv           = obj_num(cur, "uv_index");
+        weather->condition_code = (int)obj_num(cur, "weather_code");
+        deg_to_compass(obj_num(cur, "wind_direction_10m"), weather->wind_dir, sizeof(weather->wind_dir));
+        weather->temp_f       = c2f(weather->temp_c);
+        weather->feels_like_f = c2f(weather->feels_like_c);
+        weather->wind_mph     = kmh2mph(weather->wind_kph);
+        weather->precip_in    = mm2in(weather->precip_mm);
+        snprintf(weather->condition_text, sizeof(weather->condition_text), "%s",
+                 wmo_text(weather->condition_code));
     }
 
-    cJSON *forecast = cJSON_GetObjectItem(root, "forecast");
-    if (forecast) {
-        cJSON *forecastday = cJSON_GetObjectItem(forecast, "forecastday");
-        if (forecastday && cJSON_IsArray(forecastday)) {
-            int arr_size = cJSON_GetArraySize(forecastday);
-            for (int i = 0; i < arr_size && i < MAX_FORECAST_DAYS; i++) {
-                cJSON *fd = cJSON_GetArrayItem(forecastday, i);
-                if (!fd) continue;
-                forecast_day_t *day = &weather->forecast[weather->forecast_count];
-                memset(day, 0, sizeof(*day));
-
-                cJSON *v;
-                if ((v = cJSON_GetObjectItem(fd, "date")) && v->valuestring) {
-                    strncpy(day->date, v->valuestring, sizeof(day->date) - 1);
-                    const char *dn = day_name_from_date(day->date);
-                    strncpy(day->day_name, dn, sizeof(day->day_name) - 1);
-                }
-
-                cJSON *d = cJSON_GetObjectItem(fd, "day");
-                if (d) {
-                    if ((v = cJSON_GetObjectItem(d, "maxtemp_f")))      day->max_temp_f = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "maxtemp_c")))      day->max_temp_c = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "mintemp_f")))      day->min_temp_f = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "mintemp_c")))      day->min_temp_c = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "maxwind_mph")))    day->max_wind_mph = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "maxwind_kph")))    day->max_wind_kph = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "daily_chance_of_rain"))) {
-                        if (cJSON_IsString(v)) day->chance_rain = atoi(v->valuestring);
-                        else day->chance_rain = v->valueint;
-                    }
-                    if ((v = cJSON_GetObjectItem(d, "daily_chance_of_snow"))) {
-                        if (cJSON_IsString(v)) day->chance_snow = atoi(v->valuestring);
-                        else day->chance_snow = v->valueint;
-                    }
-                    if ((v = cJSON_GetObjectItem(d, "totalprecip_in"))) day->total_precip_in = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "totalprecip_mm"))) day->total_precip_mm = v->valuedouble;
-                    if ((v = cJSON_GetObjectItem(d, "avghumidity")))    day->avg_humidity = v->valueint;
-                    if ((v = cJSON_GetObjectItem(d, "uv")))             day->uv = v->valuedouble;
-                    cJSON *cond = cJSON_GetObjectItem(d, "condition");
-                    if (cond) {
-                        if ((v = cJSON_GetObjectItem(cond, "text")) && v->valuestring)
-                            strncpy(day->condition_text, v->valuestring, MAX_LABEL - 1);
-                        if ((v = cJSON_GetObjectItem(cond, "code")))
-                            day->condition_code = v->valueint;
-                        if ((v = cJSON_GetObjectItem(cond, "icon")) && v->valuestring)
-                            strncpy(day->icon_url, v->valuestring, MAX_URL - 1);
-                    }
-                }
-
-                cJSON *astro = cJSON_GetObjectItem(fd, "astro");
-                if (astro) {
-                    if ((v = cJSON_GetObjectItem(astro, "sunrise")) && v->valuestring)
-                        strncpy(day->sunrise, v->valuestring, sizeof(day->sunrise) - 1);
-                    if ((v = cJSON_GetObjectItem(astro, "sunset")) && v->valuestring)
-                        strncpy(day->sunset, v->valuestring, sizeof(day->sunset) - 1);
-                    if ((v = cJSON_GetObjectItem(astro, "moonrise")) && v->valuestring)
-                        strncpy(day->moonrise, v->valuestring, sizeof(day->moonrise) - 1);
-                    if ((v = cJSON_GetObjectItem(astro, "moonset")) && v->valuestring)
-                        strncpy(day->moonset, v->valuestring, sizeof(day->moonset) - 1);
-                    if ((v = cJSON_GetObjectItem(astro, "moon_phase")) && v->valuestring)
-                        strncpy(day->moon_phase, v->valuestring, sizeof(day->moon_phase) - 1);
-                    if ((v = cJSON_GetObjectItem(astro, "moon_illumination"))) {
-                        if (cJSON_IsString(v)) day->moon_illumination = atoi(v->valuestring);
-                        else day->moon_illumination = v->valueint;
-                    }
-                }
-
-                /* Parse hourly data */
-                cJSON *hour_arr = cJSON_GetObjectItem(fd, "hour");
-                if (hour_arr && cJSON_IsArray(hour_arr)) {
-                    int h_size = cJSON_GetArraySize(hour_arr);
-                    for (int h = 0; h < h_size && weather->hour_count < MAX_HOURS; h++) {
-                        cJSON *hr = cJSON_GetArrayItem(hour_arr, h);
-                        if (!hr) continue;
-                        hourly_t *hour = &weather->hours[weather->hour_count];
-                        memset(hour, 0, sizeof(*hour));
-
-                        if ((v = cJSON_GetObjectItem(hr, "time")) && v->valuestring) {
-                            strncpy(hour->time, v->valuestring, sizeof(hour->time) - 1);
-                            format_hour_label(hour->time, hour->hour_label, sizeof(hour->hour_label));
-                        }
-                        if ((v = cJSON_GetObjectItem(hr, "temp_f")))       hour->temp_f = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "temp_c")))       hour->temp_c = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "feelslike_f")))   hour->feels_like_f = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "feelslike_c")))   hour->feels_like_c = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "humidity")))      hour->humidity = v->valueint;
-                        if ((v = cJSON_GetObjectItem(hr, "wind_mph")))      hour->wind_mph = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "wind_kph")))      hour->wind_kph = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "wind_dir")) && v->valuestring)
-                            strncpy(hour->wind_dir, v->valuestring, sizeof(hour->wind_dir) - 1);
-                        if ((v = cJSON_GetObjectItem(hr, "chance_of_rain"))) {
-                            if (cJSON_IsString(v)) hour->chance_rain = atoi(v->valuestring);
-                            else hour->chance_rain = v->valueint;
-                        }
-                        if ((v = cJSON_GetObjectItem(hr, "chance_of_snow"))) {
-                            if (cJSON_IsString(v)) hour->chance_snow = atoi(v->valuestring);
-                            else hour->chance_snow = v->valueint;
-                        }
-                        if ((v = cJSON_GetObjectItem(hr, "precip_in")))    hour->precip_in = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "precip_mm")))    hour->precip_mm = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "cloud")))        hour->cloud = v->valueint;
-                        if ((v = cJSON_GetObjectItem(hr, "uv")))           hour->uv = v->valuedouble;
-                        if ((v = cJSON_GetObjectItem(hr, "is_day")))       hour->is_day = v->valueint;
-
-                        cJSON *hcond = cJSON_GetObjectItem(hr, "condition");
-                        if (hcond) {
-                            if ((v = cJSON_GetObjectItem(hcond, "text")) && v->valuestring)
-                                strncpy(hour->condition_text, v->valuestring, MAX_LABEL - 1);
-                            if ((v = cJSON_GetObjectItem(hcond, "code")))
-                                hour->condition_code = v->valueint;
-                            if ((v = cJSON_GetObjectItem(hcond, "icon")) && v->valuestring)
-                                strncpy(hour->icon_url, v->valuestring, MAX_URL - 1);
-                        }
-
-                        weather->hour_count++;
-                    }
-                }
-
-                weather->forecast_count++;
-            }
+    cJSON *daily = cJSON_GetObjectItem(root, "daily");
+    if (daily) {
+        cJSON *dt=cJSON_GetObjectItem(daily,"time"), *wc=cJSON_GetObjectItem(daily,"weather_code");
+        cJSON *tmax=cJSON_GetObjectItem(daily,"temperature_2m_max"), *tmin=cJSON_GetObjectItem(daily,"temperature_2m_min");
+        cJSON *sr=cJSON_GetObjectItem(daily,"sunrise"), *ss=cJSON_GetObjectItem(daily,"sunset");
+        cJSON *uvm=cJSON_GetObjectItem(daily,"uv_index_max"), *psum=cJSON_GetObjectItem(daily,"precipitation_sum");
+        cJSON *pp=cJSON_GetObjectItem(daily,"precipitation_probability_max"), *wmax=cJSON_GetObjectItem(daily,"wind_speed_10m_max");
+        int n = dt ? cJSON_GetArraySize(dt) : 0;
+        if (n > MAX_FORECAST_DAYS) n = MAX_FORECAST_DAYS;
+        for (int i = 0; i < n; i++) {
+            forecast_day_t *fd = &weather->forecast[i];
+            snprintf(fd->date, sizeof(fd->date), "%s", arr_str(dt, i));
+            snprintf(fd->day_name, sizeof(fd->day_name), "%s", day_name_from_date(fd->date));
+            fd->condition_code = (int)arr_num(wc, i);
+            snprintf(fd->condition_text, sizeof(fd->condition_text), "%s", wmo_text(fd->condition_code));
+            fd->max_temp_c = arr_num(tmax, i); fd->max_temp_f = c2f(fd->max_temp_c);
+            fd->min_temp_c = arr_num(tmin, i); fd->min_temp_f = c2f(fd->min_temp_c);
+            fd->uv = arr_num(uvm, i);
+            fd->total_precip_mm = arr_num(psum, i); fd->total_precip_in = mm2in(fd->total_precip_mm);
+            fd->chance_rain = (int)arr_num(pp, i);
+            fd->max_wind_kph = arr_num(wmax, i); fd->max_wind_mph = kmh2mph(fd->max_wind_kph);
+            iso_hhmm(arr_str(sr, i), fd->sunrise, sizeof(fd->sunrise));
+            iso_hhmm(arr_str(ss, i), fd->sunset, sizeof(fd->sunset));
+            int yy=0,mm=0,dd=0; sscanf(fd->date, "%d-%d-%d", &yy,&mm,&dd);
+            compute_moon_phase(yy, mm, dd, fd->moon_phase, sizeof(fd->moon_phase), &fd->moon_illumination);
         }
+        weather->forecast_count = n;
+    }
+
+    cJSON *hourly = cJSON_GetObjectItem(root, "hourly");
+    if (hourly) {
+        cJSON *ht=cJSON_GetObjectItem(hourly,"time"), *htemp=cJSON_GetObjectItem(hourly,"temperature_2m");
+        cJSON *hwc=cJSON_GetObjectItem(hourly,"weather_code"), *hpp=cJSON_GetObjectItem(hourly,"precipitation_probability");
+        cJSON *hday=cJSON_GetObjectItem(hourly,"is_day");
+        int total = ht ? cJSON_GetArraySize(ht) : 0;
+        time_t now = time(NULL);
+        char nowstr[20];
+        strftime(nowstr, sizeof(nowstr), "%Y-%m-%dT%H:00", localtime(&now));
+        int start = 0;
+        for (int i = 0; i < total; i++) if (strcmp(arr_str(ht, i), nowstr) >= 0) { start = i; break; }
+        int hc = 0;
+        for (int i = start; i < total && hc < MAX_HOURS && hc < 24; i++, hc++) {
+            hourly_t *h = &weather->hours[hc];
+            snprintf(h->time, sizeof(h->time), "%s", arr_str(ht, i));
+            char tmp[32]; snprintf(tmp, sizeof(tmp), "%s", h->time);
+            char *T = strchr(tmp, 'T'); if (T) *T = ' ';
+            format_hour_label(tmp, h->hour_label, sizeof(h->hour_label));
+            h->temp_c = arr_num(htemp, i); h->temp_f = c2f(h->temp_c);
+            h->condition_code = (int)arr_num(hwc, i);
+            snprintf(h->condition_text, sizeof(h->condition_text), "%s", wmo_text(h->condition_code));
+            h->chance_rain = (int)arr_num(hpp, i);
+            h->is_day = (int)arr_num(hday, i);
+        }
+        weather->hour_count = hc;
     }
 
     weather->valid = 1;
     cJSON_Delete(root);
-    cat_log("weather: %s, %.0f\xc2\xb0""F, %s, %d day forecast, %d hours",
-           weather->location_name, weather->temp_f, weather->condition_text,
-           weather->forecast_count, weather->hour_count);
     return 0;
 }
 
+/* Open-Meteo returns WMO codes, not icon URLs, so there's nothing to download;
+   the condition shows as text. A bundled WMO icon set lands in Phase 3. */
 static void load_weather_icons(weather_data_t *weather, int offline) {
-    if (weather->icon_url[0]) {
-        if (weather->icon_texture) SDL_DestroyTexture(weather->icon_texture);
-        weather->icon_texture = offline
-            ? load_cached_icon(weather->icon_url)
-            : fetch_and_load_icon(weather->icon_url);
-    }
-    for (int i = 0; i < weather->forecast_count; i++) {
-        if (weather->forecast[i].icon_url[0])
-            weather->forecast[i].icon_texture = offline
-                ? load_cached_icon(weather->forecast[i].icon_url)
-                : fetch_and_load_icon(weather->forecast[i].icon_url);
-    }
-    for (int i = 0; i < weather->hour_count; i++) {
-        if (weather->hours[i].icon_url[0])
-            weather->hours[i].icon_texture = offline
-                ? load_cached_icon(weather->hours[i].icon_url)
-                : fetch_and_load_icon(weather->hours[i].icon_url);
-    }
-    if (!g_sunrise_icon) {
-        const char *sun_url = "//cdn.weatherapi.com/weather/64x64/day/113.png";
-        g_sunrise_icon = offline ? load_cached_icon(sun_url) : fetch_and_load_icon(sun_url);
-    }
-    if (!g_sunset_icon) {
-        const char *moon_url = "//cdn.weatherapi.com/weather/64x64/night/113.png";
-        g_sunset_icon = offline ? load_cached_icon(moon_url) : fetch_and_load_icon(moon_url);
-    }
+    (void)weather; (void)offline;
 }
 
 static int load_weather_from_cache(int loc_idx) {
@@ -803,6 +756,8 @@ static int load_weather_from_cache(int loc_idx) {
     int rc = parse_weather_data(json, weather);
     free(json);
     if (rc != 0) return -1;
+    snprintf(weather->location_name, sizeof(weather->location_name), "%s",
+             g_locations[loc_idx].name);
 
     weather->is_cached = 1;
     get_weather_cache_time(loc_idx, weather->cached_time, sizeof(weather->cached_time));
@@ -818,23 +773,52 @@ static int fetch_weather_for_location(int loc_idx) {
     location_t *loc = &g_locations[loc_idx];
     weather_data_t *weather = &g_weather_cache[loc_idx];
 
-    /* Phase 1 stub: canned data so the UI runs without a network backend.
-       Replaced by the Open-Meteo fetch + parse in Phase 2 (see PLAN.md). */
-    memset(weather, 0, sizeof(*weather));
-    snprintf(weather->location_name, sizeof(weather->location_name), "%s",
-             loc->name[0] ? loc->name : "Sample City");
-    weather->temp_f = 72;       weather->temp_c = 22;
-    weather->feels_like_f = 70; weather->feels_like_c = 21;
-    weather->humidity = 55;     weather->cloud = 40;     weather->uv = 3;
-    weather->wind_mph = 8;      weather->wind_kph = 13;
-    snprintf(weather->wind_dir, sizeof(weather->wind_dir), "NW");
-    snprintf(weather->condition_text, sizeof(weather->condition_text), "Partly cloudy");
-    weather->is_day = 1;
-    weather->forecast_count = 0;
-    weather->hour_count = 0;
-    weather->valid = 1;
+    /* Resolve coordinates: a saved "lat,lon", or IP geolocation for "auto:ip". */
+    double lat = 0, lon = 0;
+    char city[MAX_LOCATION] = {0}, region[MAX_LOCATION] = {0};
+    int resolved_name = 0;
+    if (loc->lat_lon[0] && sscanf(loc->lat_lon, "%lf,%lf", &lat, &lon) == 2) {
+        /* already have coordinates */
+    } else if (strcmp(loc->name, "auto:ip") == 0) {
+        if (ip_geolocate(&lat, &lon, city, sizeof(city), region, sizeof(region)) != 0) return -1;
+        resolved_name = 1;
+    } else {
+        return -1; /* no coordinates and not auto — needs a geocoding search */
+    }
+
+    char url[MAX_URL];
+    snprintf(url, sizeof(url),
+        "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,"
+        "precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,uv_index"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,"
+        "uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
+        "&hourly=temperature_2m,weather_code,precipitation_probability,is_day"
+        "&timezone=auto&forecast_days=3", lat, lon);
+
+    pakkit_loading("Fetching weather...");
+
+    fetch_buf_t buf;
+    if (fetch_url(url, &buf) != 0) return -1;
+    int rc = parse_weather_data(buf.data, weather);
+    if (rc != 0) { free(buf.data); return rc; }
+    save_weather_json(loc_idx, buf.data);
+    free(buf.data);
+
+    /* On a fresh auto:ip resolve, adopt the discovered city + coordinates. */
+    if (resolved_name && city[0]) {
+        if (region[0]) snprintf(loc->name, MAX_LOCATION, "%s, %s", city, region);
+        else           snprintf(loc->name, MAX_LOCATION, "%s", city);
+        snprintf(loc->lat_lon, sizeof(loc->lat_lon), "%.4f,%.4f", lat, lon);
+        loc->id = 0;
+        save_locations();
+    }
+    snprintf(weather->location_name, sizeof(weather->location_name), "%s", loc->name);
     weather->is_cached = 0;
     weather->cached_time[0] = '\0';
+    cat_log("weather: %s  %.0fC (%s)  %dh %dd", weather->location_name,
+            weather->temp_c, weather->condition_text, weather->hour_count,
+            weather->forecast_count);
     return 0;
 }
 
