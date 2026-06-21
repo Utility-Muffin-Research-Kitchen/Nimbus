@@ -39,14 +39,17 @@ no API key**. It just works on first launch.
 - **Four views** — Current, Forecast (3-day), Hourly, and Astro (sun & moon).
   Switch with **L1 / R1**.
 - **Big and glanceable** — a large weather glyph beside a huge temperature, then
-  oversized stats. Designed for the handheld, not shrunk down from a phone.
+  the stats that matter: humidity, wind, UV, air quality, and a details line for
+  gusts, pressure, and dew point. Designed for the handheld, not shrunk down from
+  a phone.
 - **Theme-native** — inherits your Leaf color scheme, font, and selection-pill
   style; glyphs pick up the theme's accent.
 - **Multiple locations** — search by city or postal code, or auto-locate by IP.
   Flip between saved places with **left / right**.
 - **Instant + fresh** — shows your last-known weather immediately and refreshes in
   the background, so it never blocks on the network.
-- **No setup** — keyless weather, works offline from cache, °F / °C toggle.
+- **No setup** — keyless weather, works offline from cache, with °F / °C and
+  12 / 24-hour options.
 
 ## Install
 

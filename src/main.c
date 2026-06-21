@@ -98,6 +98,10 @@ typedef struct {
     double max_temp_c;
     double min_temp_f;
     double min_temp_c;
+    double feels_max_f;
+    double feels_max_c;
+    double feels_min_f;
+    double feels_min_c;
     double max_wind_mph;
     double max_wind_kph;
     int    chance_rain;
@@ -143,6 +147,12 @@ typedef struct {
     double precip_mm;
     int    cloud;
     double uv;
+    double wind_gust_mph;
+    double wind_gust_kph;
+    double pressure_hpa;
+    double dew_point_f;
+    double dew_point_c;
+    int    aqi;             /* US AQI, -1 if unavailable */
     char   last_updated[64];
 
     forecast_day_t forecast[MAX_FORECAST_DAYS];
@@ -165,6 +175,7 @@ typedef struct {
 
 typedef struct {
     int use_fahrenheit;
+    int use_24h;          /* 1 = 24-hour clock, 0 = 12-hour (no leading zero) */
 } app_settings_t;
 
 /* -----------------------------------------------------------------------
@@ -223,13 +234,35 @@ static const char *day_name_from_date(const char *date_str) {
     return names[tm_val.tm_wday % 7];
 }
 
+/* Format hour:minute per the 12/24h setting. 12-hour drops the leading zero
+   ("6:27 AM"); 24-hour is zero-padded ("06:27"). */
+static void format_clock(int hour, int min, char *out, size_t n) {
+    if (g_settings.use_24h) {
+        snprintf(out, n, "%02d:%02d", hour, min);
+    } else {
+        const char *ap = (hour >= 12) ? "PM" : "AM";
+        int h12 = hour % 12;
+        if (h12 == 0) h12 = 12;
+        snprintf(out, n, "%d:%02d %s", h12, min, ap);
+    }
+}
+
+/* "HH:MM" (24-hour) -> a clock string in the current format. */
+static void format_hhmm(const char *hhmm, char *out, size_t n) {
+    int h = 0, m = 0;
+    if (sscanf(hhmm, "%d:%d", &h, &m) == 2) format_clock(h, m, out, n);
+    else snprintf(out, n, "%s", hhmm);
+}
+
+/* Compact on-the-hour label for the Hourly list: "2 PM" or "14:00". */
 static void format_hour_label(const char *time_str, char *out, size_t out_size) {
-    /* Input: "2024-01-15 14:00", Output: "2 PM" */
+    /* Input: "2024-01-15 14:00" */
     out[0] = '\0';
     const char *space = strchr(time_str, ' ');
     if (!space) return;
     int hour = 0;
     sscanf(space + 1, "%d", &hour);
+    if (g_settings.use_24h) { snprintf(out, out_size, "%02d:00", hour); return; }
     if (hour == 0) snprintf(out, out_size, "12 AM");
     else if (hour < 12) snprintf(out, out_size, "%d AM", hour);
     else if (hour == 12) snprintf(out, out_size, "12 PM");
@@ -372,12 +405,7 @@ static void get_weather_cache_time(int loc_idx, char *out, size_t out_size) {
     if (stat(path, &st) != 0) return;
     struct tm *tm_info = localtime(&st.st_mtime);
     if (!tm_info) return;
-    int hour = tm_info->tm_hour;
-    int min = tm_info->tm_min;
-    const char *ampm = (hour >= 12) ? "PM" : "AM";
-    if (hour == 0) hour = 12;
-    else if (hour > 12) hour -= 12;
-    snprintf(out, out_size, "%d:%02d %s", hour, min, ampm);
+    format_clock(tm_info->tm_hour, tm_info->tm_min, out, out_size);
 }
 
 /* -----------------------------------------------------------------------
@@ -386,6 +414,7 @@ static void get_weather_cache_time(int loc_idx, char *out, size_t out_size) {
 
 static void settings_set_defaults(void) {
     g_settings.use_fahrenheit = 1;
+    g_settings.use_24h = 0;
 }
 
 static void settings_save(void) {
@@ -395,6 +424,7 @@ static void settings_save(void) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "units=%s\n", g_settings.use_fahrenheit ? "F" : "C");
+    fprintf(f, "clock=%s\n", g_settings.use_24h ? "24" : "12");
     fclose(f);
 }
 
@@ -416,9 +446,12 @@ static void settings_load(void) {
         trim_inplace(key); trim_inplace(val);
         if (strcmp(key, "units") == 0)
             g_settings.use_fahrenheit = (val[0] == 'F' || val[0] == 'f') ? 1 : 0;
+        else if (strcmp(key, "clock") == 0)
+            g_settings.use_24h = (strncmp(val, "24", 2) == 0) ? 1 : 0;
     }
     fclose(f);
-    cat_log("settings: loaded (units=%s)", g_settings.use_fahrenheit ? "F" : "C");
+    cat_log("settings: loaded (units=%s clock=%s)",
+            g_settings.use_fahrenheit ? "F" : "C", g_settings.use_24h ? "24" : "12");
 }
 
 /* -----------------------------------------------------------------------
@@ -731,6 +764,7 @@ static int parse_weather_data(const char *json_str, weather_data_t *weather) {
     cJSON *root = cJSON_Parse(json_str);
     if (!root) return -1;
     memset(weather, 0, sizeof(*weather));
+    weather->aqi = -1;   /* set later by the (separate) air-quality fetch */
     weather->loc_lat = obj_num(root, "latitude");
     weather->loc_lon = obj_num(root, "longitude");
 
@@ -744,11 +778,16 @@ static int parse_weather_data(const char *json_str, weather_data_t *weather) {
         weather->cloud        = (int)obj_num(cur, "cloud_cover");
         weather->wind_kph     = obj_num(cur, "wind_speed_10m");
         weather->uv           = obj_num(cur, "uv_index");
+        weather->wind_gust_kph = obj_num(cur, "wind_gusts_10m");
+        weather->pressure_hpa  = obj_num(cur, "pressure_msl");
+        weather->dew_point_c   = obj_num(cur, "dew_point_2m");
         weather->condition_code = (int)obj_num(cur, "weather_code");
         deg_to_compass(obj_num(cur, "wind_direction_10m"), weather->wind_dir, sizeof(weather->wind_dir));
         weather->temp_f       = c2f(weather->temp_c);
         weather->feels_like_f = c2f(weather->feels_like_c);
         weather->wind_mph     = kmh2mph(weather->wind_kph);
+        weather->wind_gust_mph = kmh2mph(weather->wind_gust_kph);
+        weather->dew_point_f  = c2f(weather->dew_point_c);
         weather->precip_in    = mm2in(weather->precip_mm);
         snprintf(weather->condition_text, sizeof(weather->condition_text), "%s",
                  wmo_text(weather->condition_code));
@@ -761,6 +800,7 @@ static int parse_weather_data(const char *json_str, weather_data_t *weather) {
         cJSON *sr=cJSON_GetObjectItem(daily,"sunrise"), *ss=cJSON_GetObjectItem(daily,"sunset");
         cJSON *uvm=cJSON_GetObjectItem(daily,"uv_index_max"), *psum=cJSON_GetObjectItem(daily,"precipitation_sum");
         cJSON *pp=cJSON_GetObjectItem(daily,"precipitation_probability_max"), *wmax=cJSON_GetObjectItem(daily,"wind_speed_10m_max");
+        cJSON *amax=cJSON_GetObjectItem(daily,"apparent_temperature_max"), *amin=cJSON_GetObjectItem(daily,"apparent_temperature_min");
         int n = dt ? cJSON_GetArraySize(dt) : 0;
         if (n > MAX_FORECAST_DAYS) n = MAX_FORECAST_DAYS;
         for (int i = 0; i < n; i++) {
@@ -771,6 +811,8 @@ static int parse_weather_data(const char *json_str, weather_data_t *weather) {
             snprintf(fd->condition_text, sizeof(fd->condition_text), "%s", wmo_text(fd->condition_code));
             fd->max_temp_c = arr_num(tmax, i); fd->max_temp_f = c2f(fd->max_temp_c);
             fd->min_temp_c = arr_num(tmin, i); fd->min_temp_f = c2f(fd->min_temp_c);
+            fd->feels_max_c = arr_num(amax, i); fd->feels_max_f = c2f(fd->feels_max_c);
+            fd->feels_min_c = arr_num(amin, i); fd->feels_min_f = c2f(fd->feels_min_c);
             fd->uv = arr_num(uvm, i);
             fd->total_precip_mm = arr_num(psum, i); fd->total_precip_in = mm2in(fd->total_precip_mm);
             fd->chance_rain = (int)arr_num(pp, i);
@@ -870,9 +912,11 @@ static int fetch_weather_core(const fetch_req_t *req, weather_data_t *out,
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
         "&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,"
-        "precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,uv_index"
+        "precipitation,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,uv_index,"
+        "wind_gusts_10m,pressure_msl,dew_point_2m"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,"
-        "uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
+        "uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,"
+        "apparent_temperature_max,apparent_temperature_min"
         "&hourly=temperature_2m,weather_code,precipitation_probability,is_day"
         "&timezone=auto&forecast_days=3", lat, lon);
 
@@ -882,6 +926,24 @@ static int fetch_weather_core(const fetch_req_t *req, weather_data_t *out,
     if (rc == 0) save_weather_json(req->idx, buf.data);
     free(buf.data);
     if (rc != 0) return rc;
+
+    /* Air quality is a separate (keyless) Open-Meteo endpoint; best-effort, so a
+       failure here never fails the weather fetch. */
+    char aq_url[MAX_URL];
+    snprintf(aq_url, sizeof(aq_url),
+        "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%.4f&longitude=%.4f"
+        "&current=us_aqi", lat, lon);
+    fetch_buf_t aq;
+    if (fetch_url(aq_url, &aq) == 0) {
+        cJSON *aroot = cJSON_Parse(aq.data);
+        if (aroot) {
+            cJSON *acur = cJSON_GetObjectItem(aroot, "current");
+            cJSON *aqi = acur ? cJSON_GetObjectItem(acur, "us_aqi") : NULL;
+            if (aqi && cJSON_IsNumber(aqi)) out->aqi = (int)(aqi->valuedouble + 0.5);
+            cJSON_Delete(aroot);
+        }
+        free(aq.data);
+    }
 
     if (resolved_name && city[0]) {
         if (region[0]) snprintf(res_name, name_n, "%s, %s", city, region);
@@ -1202,17 +1264,26 @@ static void show_settings(void) {
             { .label = "Fahrenheit", .value = "\xc2\xb0""F" },
             { .label = "Celsius",    .value = "\xc2\xb0""C" },
         };
-        cat_options_item items[3];
+        cat_option clock_opts[] = {
+            { .label = "12-hour", .value = "12h" },
+            { .label = "24-hour", .value = "24h" },
+        };
+        cat_options_item items[4];
         memset(items, 0, sizeof(items));
         items[0].label = "Units";
         items[0].type = CAT_OPT_STANDARD;
         items[0].options = unit_opts;
         items[0].option_count = 2;
         items[0].selected_option = g_settings.use_fahrenheit ? 0 : 1;
-        items[1].label = "Locations";
-        items[1].type = CAT_OPT_CLICKABLE;
-        items[2].label = "About";
+        items[1].label = "Time";
+        items[1].type = CAT_OPT_STANDARD;
+        items[1].options = clock_opts;
+        items[1].option_count = 2;
+        items[1].selected_option = g_settings.use_24h ? 1 : 0;
+        items[2].label = "Locations";
         items[2].type = CAT_OPT_CLICKABLE;
+        items[3].label = "About";
+        items[3].type = CAT_OPT_CLICKABLE;
 
         cat_footer_item footer[] = {
             { .button = CAT_BTN_B, .label = "Back" },
@@ -1221,7 +1292,7 @@ static void show_settings(void) {
         cat_options_list_opts opts = {
             .title = "Settings",
             .items = items,
-            .item_count = 3,
+            .item_count = 4,
             .footer = footer,
             .footer_count = NB_HINTS(2),
             .initial_selected_index = focus,
@@ -1230,13 +1301,14 @@ static void show_settings(void) {
         cat_options_list(&opts, &res);
         focus = res.focused_index;
 
-        /* Commit Units from the (possibly cycled) standard option. */
+        /* Commit the cycleable options. */
         g_settings.use_fahrenheit = (items[0].selected_option == 0) ? 1 : 0;
+        g_settings.use_24h = (items[1].selected_option == 1) ? 1 : 0;
         settings_save();
 
         if (res.action == CAT_ACTION_SELECTED) {
-            if (res.focused_index == 1) show_locations();
-            else if (res.focused_index == 2) show_about();
+            if (res.focused_index == 2) show_locations();
+            else if (res.focused_index == 3) show_about();
             continue;
         }
         return;   /* B / back closes Settings */
@@ -1259,11 +1331,12 @@ static void draw_centered_text(TTF_Font *f, const char *s, int cx, int y, cat_dr
    at wants big, chunky type, so Nimbus carries its own larger ladder. Sizes are
    "base" units (× device_scale at runtime, exactly like the tiers), opened from
    the active theme font and cached by (path, px). */
-#define NB_SZ_TEMP   78   /* hero temperature           (~156px on MLP1) */
-#define NB_SZ_GLYPH  92   /* weather glyph centerpiece  (~184px) */
+#define NB_SZ_TEMP   76   /* hero temperature           (~152px on MLP1) */
+#define NB_SZ_GLYPH  90   /* weather glyph centerpiece  (~180px) */
 #define NB_SZ_COND   30   /* condition line             (~60px) */
 #define NB_SZ_VALUE  28   /* stat value                 (~56px) */
 #define NB_SZ_LABEL  17   /* stat / feels-like caption  (~34px) */
+#define NB_SZ_DETAIL 15   /* Current secondary details line (~30px) */
 
 #define NB_FONT_CACHE 16
 static struct { char path[512]; int px; TTF_Font *f; } nb_fcache[NB_FONT_CACHE];
@@ -1418,7 +1491,9 @@ static void draw_tab_current(weather_data_t *weather, int content_y, int content
         gx += glyph_w;
     }
     cat_draw_text(f_temp, temp_str, gx, row_cy - temp_h / 2, text_color);
-    y += row_h + CAT_DS(8);
+    /* Advance to just below the visible temp/glyph, trimming the font's descent
+       padding (the digits have no descenders) so the hero isn't needlessly tall. */
+    y = row_cy + temp_h * 36 / 100 + CAT_DS(8);
 
     /* Condition + feels-like, centered. */
     draw_centered_text(f_cond, weather->condition_text, cx, y, text_color);
@@ -1430,36 +1505,46 @@ static void draw_tab_current(weather_data_t *weather, int content_y, int content
     draw_centered_text(f_cap, feels_str, cx, y, hint_color);
     y += TTF_FontHeight(f_cap);
 
-    /* One row of four oversized stats. */
+    /* One row of four big stats, plus a subtle details line for the extras. */
+    int use_f = g_settings.use_fahrenheit;
     struct { char value[24]; const char *label; } stats[4];
     snprintf(stats[0].value, sizeof(stats[0].value), "%d%%", weather->humidity);
     stats[0].label = "Humidity";
     snprintf(stats[1].value, sizeof(stats[1].value), "%.0f %s",
-             g_settings.use_fahrenheit ? weather->wind_mph : weather->wind_kph, weather->wind_dir);
-    stats[1].label = g_settings.use_fahrenheit ? "Wind mph" : "Wind kmh";
-    if (g_settings.use_fahrenheit)
-        snprintf(stats[2].value, sizeof(stats[2].value), "%.2f\"", weather->precip_in);
-    else
-        snprintf(stats[2].value, sizeof(stats[2].value), "%.1fmm", weather->precip_mm);
-    stats[2].label = "Precip";
-    snprintf(stats[3].value, sizeof(stats[3].value), "%.0f", weather->uv);
-    stats[3].label = "UV Index";
+             use_f ? weather->wind_mph : weather->wind_kph, weather->wind_dir);
+    stats[1].label = use_f ? "Wind mph" : "Wind kmh";
+    snprintf(stats[2].value, sizeof(stats[2].value), "%.0f", weather->uv);
+    stats[2].label = "UV Index";
+    if (weather->aqi >= 0) snprintf(stats[3].value, sizeof(stats[3].value), "%d", weather->aqi);
+    else                   stats[3].value[0] = '\0';
+    stats[3].label = "Air Quality";
 
-    /* Pin the stat row to the bottom of the content area so it's always fully
-       on screen under the big hero (no hidden scroll). Calm whitespace sits
-       between "Feels like" and the stats. */
-    int val_h = TTF_FontHeight(f_val), lbl_h = TTF_FontHeight(f_cap);
-    int stat_block = val_h + CAT_DS(2) + lbl_h;
-    int stat_y = content_y + content_h - stat_block - CAT_DS(10);
-    if (stat_y < y + CAT_DS(12)) stat_y = y + CAT_DS(12);  /* never overlap the hero */
+    char details[96];
+    if (use_f)
+        snprintf(details, sizeof(details),
+                 "Gust %.0f mph  \xc2\xb7  %.1f in  \xc2\xb7  Dew %.0f\xc2\xb0",
+                 weather->wind_gust_mph, weather->pressure_hpa * 0.02953, weather->dew_point_f);
+    else
+        snprintf(details, sizeof(details),
+                 "Gust %.0f kmh  \xc2\xb7  %.0f mb  \xc2\xb7  Dew %.0f\xc2\xb0",
+                 weather->wind_gust_kph, weather->pressure_hpa, weather->dew_point_c);
+
+    /* Pin the stat row + details line to the bottom of the content area so it's
+       always fully on screen under the big hero (no hidden scroll). */
+    TTF_Font *f_det = nb_font(NB_SZ_DETAIL);
+    int val_h = TTF_FontHeight(f_val), lbl_h = TTF_FontHeight(f_cap), det_h = TTF_FontHeight(f_det);
+    int block_h = val_h + lbl_h + CAT_DS(4) + det_h;
+    int stat_y = content_y + content_h - block_h - CAT_DS(6);
+    if (stat_y < y + CAT_DS(8)) stat_y = y + CAT_DS(8);  /* never overlap the hero */
 
     int margin = CAT_DS(16);
     int col_w  = (sw - margin * 2) / 4;
     for (int i = 0; i < 4; i++) {
         int scx = margin + col_w * i + col_w / 2;
         draw_centered_text(f_val, stats[i].value[0] ? stats[i].value : "\xe2\x80\x94", scx, stat_y, text_color);
-        draw_centered_text(f_cap, stats[i].label, scx, stat_y + val_h + CAT_DS(2), hint_color);
+        draw_centered_text(f_cap, stats[i].label, scx, stat_y + val_h, hint_color);
     }
+    draw_centered_text(f_det, details, cx, stat_y + val_h + lbl_h + CAT_DS(4), hint_color);
 
     /* Content fits the viewport — no scrolling on Current. */
     *total_h = content_h;
@@ -1483,7 +1568,7 @@ static void draw_tab_forecast(weather_data_t *weather, int content_y, int conten
     int glyph_base = NB_SZ_COND + 8;          /* a touch bigger than the day text */
     int glyph_cx  = margin + CAT_DS(26);
     int text_x    = margin + CAT_DS(58);
-    int row_h     = CAT_DS(78);               /* chunky fixed rows */
+    int row_h     = CAT_DS(88);               /* chunky fixed rows */
 
     int y = content_y - scroll_y + CAT_DS(4);
     int day_h = TTF_FontHeight(f_day), cap_h = TTF_FontHeight(f_cap), temp_h = TTF_FontHeight(f_temp);
@@ -1494,27 +1579,33 @@ static void draw_tab_forecast(weather_data_t *weather, int content_y, int conten
 
         draw_glyph_mid(wmo_glyph_cp(day->condition_code, 1), glyph_base, glyph_cx, cy, glyph_color);
 
-        /* Left: day name + condition, vertically centered as a block. */
+        int use_f = g_settings.use_fahrenheit;
+
+        /* Left: day, condition, rain — vertically centered as a block. */
         const char *dname = (i == 0) ? "Today" : day->day_name;
-        int lblock = day_h + CAT_DS(2) + cap_h;
+        char rain[24];
+        snprintf(rain, sizeof(rain), "Rain %d%%", day->chance_rain);
+        int lblock = day_h + cap_h + cap_h + CAT_DS(4);
         int ly = y + (row_h - lblock) / 2;
         cat_draw_text(f_day, dname, text_x, ly, text_color);
         cat_draw_text_ellipsized(f_cap, day->condition_text, text_x, ly + day_h + CAT_DS(2),
                                  hint_color, sw / 2 - text_x);
+        cat_draw_text(f_cap, rain, text_x, ly + day_h + cap_h + CAT_DS(4), hint_color);
 
-        /* Right: high / low + rain, right-aligned and vertically centered. */
-        char hilo[48];
+        /* Right: high/low + feels-like range, right-aligned and centered. */
+        char hilo[48], feels[48];
         snprintf(hilo, sizeof(hilo), "%.0f\xc2\xb0 / %.0f\xc2\xb0",
-                 g_settings.use_fahrenheit ? day->max_temp_f : day->max_temp_c,
-                 g_settings.use_fahrenheit ? day->min_temp_f : day->min_temp_c);
-        char rain[24];
-        snprintf(rain, sizeof(rain), "Rain %d%%", day->chance_rain);
+                 use_f ? day->max_temp_f : day->max_temp_c,
+                 use_f ? day->min_temp_f : day->min_temp_c);
+        snprintf(feels, sizeof(feels), "Feels %.0f\xc2\xb0 / %.0f\xc2\xb0",
+                 use_f ? day->feels_max_f : day->feels_max_c,
+                 use_f ? day->feels_min_f : day->feels_min_c);
         int rblock = temp_h + CAT_DS(2) + cap_h;
         int ry = y + (row_h - rblock) / 2;
         int hilo_w = cat_measure_text(f_temp, hilo);
-        int rain_w = cat_measure_text(f_cap, rain);
+        int feels_w = cat_measure_text(f_cap, feels);
         cat_draw_text(f_temp, hilo, sw - margin - hilo_w, ry, text_color);
-        cat_draw_text(f_cap, rain, sw - margin - rain_w, ry + temp_h + CAT_DS(2), hint_color);
+        cat_draw_text(f_cap, feels, sw - margin - feels_w, ry + temp_h + CAT_DS(2), hint_color);
 
         y += row_h;
         if (i < n - 1) cat_draw_rect(margin, y, sw - margin * 2, 1, hint_color);
@@ -1571,7 +1662,14 @@ static void draw_tab_hourly(weather_data_t *weather, int content_y, int content_
         draw_glyph_mid(wmo_glyph_cp(hr->condition_code, hr->is_day), glyph_base,
                        glyph_cx, cy, glyph_color);
 
-        cat_draw_text(f_hour, hr->hour_label, hour_x, cy - TTF_FontHeight(f_hour) / 2, text_color);
+        /* Reformat live so a 12/24h change applies without a re-fetch. */
+        char hour_lbl[16];
+        char tnorm[32];
+        snprintf(tnorm, sizeof(tnorm), "%s", hr->time);
+        char *Tsep = strchr(tnorm, 'T');
+        if (Tsep) *Tsep = ' ';
+        format_hour_label(tnorm, hour_lbl, sizeof(hour_lbl));
+        cat_draw_text(f_hour, hour_lbl, hour_x, cy - TTF_FontHeight(f_hour) / 2, text_color);
 
         char temp_str[16];
         snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0",
@@ -1633,9 +1731,12 @@ static void draw_tab_astro(weather_data_t *weather, int content_y, int content_h
         /* Sun: sunrise (left) + sunset (right), big with accent glyphs. */
         int cy = y + val_h / 2;
         draw_glyph_mid(0xF051, glyph_base, gx_l, cy, glyph_color);   /* sunrise */
-        cat_draw_text(f_val, day->sunrise[0] ? day->sunrise : "--", tx_l, y, text_color);
+        char sr_str[16], ss_str[16];
+        if (day->sunrise[0]) format_hhmm(day->sunrise, sr_str, sizeof(sr_str)); else snprintf(sr_str, sizeof(sr_str), "--");
+        if (day->sunset[0])  format_hhmm(day->sunset,  ss_str, sizeof(ss_str)); else snprintf(ss_str, sizeof(ss_str), "--");
+        cat_draw_text(f_val, sr_str, tx_l, y, text_color);
         draw_glyph_mid(0xF052, glyph_base, gx_r, cy, glyph_color);   /* sunset */
-        cat_draw_text(f_val, day->sunset[0] ? day->sunset : "--", tx_r, y, text_color);
+        cat_draw_text(f_val, ss_str, tx_r, y, text_color);
         y += val_h + CAT_DS(4);
 
         if (day->sunrise[0] && day->sunset[0]) {
