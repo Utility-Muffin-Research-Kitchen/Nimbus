@@ -74,26 +74,34 @@ def main():
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, W - 1, W - 1], RADIUS * SS, fill=255)
     img.paste(grad, (0, 0), mask)
 
-    # "Nimbus" above, delicate Nunito Light.
-    word_font = ImageFont.truetype(NUNITO, int(46 * SS))
-    try:
-        word_font.set_variation_by_name("Light")
-    except Exception:
-        pass
     d = ImageDraw.Draw(img)
-    bb = d.textbbox((0, 0), "Nimbus", font=word_font)
-    tw, th = bb[2] - bb[0], bb[3] - bb[1]
-    word_y = int(W * 0.16)
-    d.text((W // 2 - tw / 2 - bb[0], word_y - bb[1]), "Nimbus", font=word_font, fill=WORD + (255,))
 
-    # Original cloud below, scaled to a chunky width, centered in the lower area.
+    def nunito(px):
+        f = ImageFont.truetype(NUNITO, int(px * SS))
+        try:
+            f.set_variation_by_name("Light")
+        except Exception:
+            pass
+        return f
+
+    def draw_centered(text, font, top_y):
+        bb = d.textbbox((0, 0), text, font=font)
+        d.text((W // 2 - (bb[2] - bb[0]) / 2 - bb[0], top_y - bb[1]), text, font=font, fill=WORD + (255,))
+
+    # "Nimbus" wordmark up top, delicate Nunito Light.
+    draw_centered("Nimbus", nunito(44), int(W * 0.12))
+
+    # Original cloud, anchored at a fixed bottom and grown upward.
     cloud = extract_cloud()
-    target_w = int(W * 0.64)
+    target_w = int(W * 0.74)
     scale = target_w / cloud.width
-    cloud = cloud.resize((target_w, int(cloud.height * scale)), Image.LANCZOS)
-    cx = (W - cloud.width) // 2
-    cy = int(W * 0.40)
-    img.alpha_composite(cloud, (cx, cy))
+    ch = int(cloud.height * scale)
+    cloud = cloud.resize((target_w, ch), Image.LANCZOS)
+    cloud_bottom = int(W * 0.728)
+    img.alpha_composite(cloud, ((W - cloud.width) // 2, cloud_bottom - ch))
+
+    # "Pocket 1 Weather" along the bottom, same font a bit smaller.
+    draw_centered("Pocket 1 Weather", nunito(26), int(W * 0.82))
 
     img = img.resize((SIZE, SIZE), Image.LANCZOS)
     out = os.path.join(ROOT, "res", "icon.png")
