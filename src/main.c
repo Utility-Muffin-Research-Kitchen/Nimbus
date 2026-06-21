@@ -21,10 +21,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <math.h>
-
-/* Nimbus UI widgets reimplemented on Catastrophe (replaces PakKit). */
-#define NIMBUS_UI_IMPLEMENTATION
-#include "nimbus_ui.h"
+#include <pthread.h>
 
 /* -----------------------------------------------------------------------
  * Constants
@@ -185,6 +182,17 @@ static app_settings_t  g_settings;
 static SDL_Texture    *g_sunrise_icon             = NULL;
 static SDL_Texture    *g_sunset_icon              = NULL;
 
+/* Background weather fetch: a worker thread fills g_weather_cache so the UI never
+   blocks on the network. g_data_lock guards g_weather_cache + g_locations writes;
+   g_fetch_active marks a fetch in flight (shown as an "Updating" indicator). */
+static pthread_mutex_t g_data_lock   = PTHREAD_MUTEX_INITIALIZER;
+static volatile int    g_fetch_active = 0;
+
+/* Whether to draw footer button hints — mirrors Leaf's global "Show Hints"
+   setting (CAT_SHOW_HINTS, exported by jawakad). Read once at startup. */
+static int g_show_hints = 1;
+#define NB_HINTS(n) (g_show_hints ? (n) : 0)
+
 /* -----------------------------------------------------------------------
  * String helpers
  * ----------------------------------------------------------------------- */
@@ -238,6 +246,72 @@ static int check_wifi(void) {
 #else
     return cat__get_wifi_strength() > 0;
 #endif
+}
+
+/* -----------------------------------------------------------------------
+ * Local UI helpers (Catastrophe-native)
+ * ----------------------------------------------------------------------- */
+
+/* One-frame "working…" splash drawn before a blocking network call. */
+static void nb_loading(const char *message) {
+    cat_theme *th = cat_get_theme();
+    TTF_Font *f = cat_get_font(CAT_FONT_MEDIUM);
+    int sw = cat_get_screen_width(), sh = cat_get_screen_height();
+    cat_clear_screen();
+    cat_draw_background();
+    if (message) {
+        int w = cat_measure_text(f, message);
+        cat_draw_text(f, message, (sw - w) / 2, sh / 2 - TTF_FontHeight(f) / 2, th->text);
+    }
+    cat_present();
+}
+
+/* Acknowledgement message (single button) via the native confirmation widget. */
+static void nb_message(const char *message, const char *button_label) {
+    cat_footer_item footer[] = {
+        { .button = CAT_BTN_A, .label = button_label ? button_label : "OK", .is_confirm = true },
+    };
+    cat_message_opts opts = { .message = message, .footer = footer, .footer_count = NB_HINTS(1) };
+    cat_confirm_result r = {0};
+    cat_confirmation(&opts, &r);
+}
+
+/* Yes/No confirmation. Returns 1 on confirm (A), 0 on cancel (B). */
+static int nb_confirm(const char *message, const char *confirm_label, const char *cancel_label) {
+    cat_footer_item footer[] = {
+        { .button = CAT_BTN_A, .label = confirm_label ? confirm_label : "Confirm", .is_confirm = true },
+        { .button = CAT_BTN_B, .label = cancel_label ? cancel_label : "Cancel" },
+    };
+    cat_message_opts opts = { .message = message, .footer = footer, .footer_count = NB_HINTS(2) };
+    cat_confirm_result r = {0};
+    return (cat_confirmation(&opts, &r) == CAT_OK) ? 1 : 0;
+}
+
+/* Custom-content vertical scroll for the weather tabs: a small eased offset.
+   The tab bodies are hand-drawn under a clip rect, so they steer a scroll_y
+   directly rather than use cat_draw_scroll_view's content callback. */
+typedef struct { int scroll_y; int target_scroll_y; int last_max_scroll; } nb_scroll_state;
+
+static void nb_scroll_handle_input(nb_scroll_state *s, int direction, int step) {
+    if (!s) return;
+    s->target_scroll_y += direction * step;
+    if (s->target_scroll_y < 0) s->target_scroll_y = 0;
+    if (s->target_scroll_y > s->last_max_scroll) s->target_scroll_y = s->last_max_scroll;
+}
+static void nb_scroll_animate(nb_scroll_state *s) {
+    if (!s) return;
+    int d = s->target_scroll_y - s->scroll_y;
+    if (d > -2 && d < 2) { s->scroll_y = s->target_scroll_y; return; }
+    s->scroll_y += d * 15 / 100;  /* ~0.15 ease toward target */
+}
+static void nb_scroll_update(nb_scroll_state *s, int content_height, int viewport_height) {
+    if (!s) return;
+    int maxs = content_height - viewport_height;
+    if (maxs < 0) maxs = 0;
+    s->last_max_scroll = maxs;
+    if (s->target_scroll_y > maxs) s->target_scroll_y = maxs;
+    if (s->scroll_y > maxs) s->scroll_y = maxs;
+    if (s->scroll_y < 0) s->scroll_y = 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -768,18 +842,24 @@ static int load_weather_from_cache(int loc_idx) {
     return 0;
 }
 
-static int fetch_weather_for_location(int loc_idx) {
-    if (loc_idx < 0 || loc_idx >= g_location_count) return -1;
-    location_t *loc = &g_locations[loc_idx];
-    weather_data_t *weather = &g_weather_cache[loc_idx];
+/* A fetch request: location index + a snapshot of its name/coords, so the worker
+   never reads g_locations while the main thread may be mutating it. */
+typedef struct {
+    int  idx;
+    char name[MAX_LOCATION];
+    char lat_lon[64];
+} fetch_req_t;
 
-    /* Resolve coordinates: a saved "lat,lon", or IP geolocation for "auto:ip". */
+/* Pure network + parse for one request into *out. No SDL, no global mutation.
+   On a fresh auto:ip resolve, fills res_name/res_ll with the discovered city. */
+static int fetch_weather_core(const fetch_req_t *req, weather_data_t *out,
+                              char *res_name, size_t name_n, char *res_ll, size_t ll_n) {
     double lat = 0, lon = 0;
     char city[MAX_LOCATION] = {0}, region[MAX_LOCATION] = {0};
     int resolved_name = 0;
-    if (loc->lat_lon[0] && sscanf(loc->lat_lon, "%lf,%lf", &lat, &lon) == 2) {
+    if (req->lat_lon[0] && sscanf(req->lat_lon, "%lf,%lf", &lat, &lon) == 2) {
         /* already have coordinates */
-    } else if (strcmp(loc->name, "auto:ip") == 0) {
+    } else if (strcmp(req->name, "auto:ip") == 0) {
         if (ip_geolocate(&lat, &lon, city, sizeof(city), region, sizeof(region)) != 0) return -1;
         resolved_name = 1;
     } else {
@@ -796,30 +876,76 @@ static int fetch_weather_for_location(int loc_idx) {
         "&hourly=temperature_2m,weather_code,precipitation_probability,is_day"
         "&timezone=auto&forecast_days=3", lat, lon);
 
-    pakkit_loading("Fetching weather...");
-
     fetch_buf_t buf;
     if (fetch_url(url, &buf) != 0) return -1;
-    int rc = parse_weather_data(buf.data, weather);
-    if (rc != 0) { free(buf.data); return rc; }
-    save_weather_json(loc_idx, buf.data);
+    int rc = parse_weather_data(buf.data, out);
+    if (rc == 0) save_weather_json(req->idx, buf.data);
     free(buf.data);
+    if (rc != 0) return rc;
 
-    /* On a fresh auto:ip resolve, adopt the discovered city + coordinates. */
     if (resolved_name && city[0]) {
-        if (region[0]) snprintf(loc->name, MAX_LOCATION, "%s, %s", city, region);
-        else           snprintf(loc->name, MAX_LOCATION, "%s", city);
-        snprintf(loc->lat_lon, sizeof(loc->lat_lon), "%.4f,%.4f", lat, lon);
-        loc->id = 0;
-        save_locations();
+        if (region[0]) snprintf(res_name, name_n, "%s, %s", city, region);
+        else           snprintf(res_name, name_n, "%s", city);
+        snprintf(res_ll, ll_n, "%.4f,%.4f", lat, lon);
     }
-    snprintf(weather->location_name, sizeof(weather->location_name), "%s", loc->name);
-    weather->is_cached = 0;
-    weather->cached_time[0] = '\0';
-    cat_log("weather: %s  %.0fC (%s)  %dh %dd", weather->location_name,
-            weather->temp_c, weather->condition_text, weather->hour_count,
-            weather->forecast_count);
     return 0;
+}
+
+/* Background worker: fetch, then publish into g_weather_cache under the lock. */
+static void *fetch_worker(void *arg) {
+    fetch_req_t req = *(fetch_req_t *)arg;
+    free(arg);
+
+    weather_data_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    char rname[MAX_LOCATION] = {0}, rll[64] = {0};
+    int rc = fetch_weather_core(&req, &tmp, rname, sizeof(rname), rll, sizeof(rll));
+
+    pthread_mutex_lock(&g_data_lock);
+    if (rc == 0 && req.idx >= 0 && req.idx < g_location_count) {
+        if (rname[0]) {
+            snprintf(g_locations[req.idx].name, MAX_LOCATION, "%s", rname);
+            snprintf(g_locations[req.idx].lat_lon, sizeof(g_locations[req.idx].lat_lon), "%s", rll);
+            g_locations[req.idx].id = 0;
+            save_locations();
+        }
+        snprintf(tmp.location_name, sizeof(tmp.location_name), "%s", g_locations[req.idx].name);
+        tmp.is_cached = 0;
+        tmp.cached_time[0] = '\0';
+        g_weather_cache[req.idx] = tmp;
+        cat_log("weather: %s  %.0fC (%s)  %dh %dd", tmp.location_name,
+                tmp.temp_c, tmp.condition_text, tmp.hour_count, tmp.forecast_count);
+    }
+    g_fetch_active = 0;
+    pthread_mutex_unlock(&g_data_lock);
+    return NULL;
+}
+
+/* Kick off a non-blocking refresh for a location (no-op if offline or one is
+   already running). The UI keeps rendering cached data meanwhile. */
+static void request_refresh(int idx) {
+    if (idx < 0 || idx >= g_location_count) return;
+    if (!check_wifi()) return;
+
+    pthread_mutex_lock(&g_data_lock);
+    if (g_fetch_active) { pthread_mutex_unlock(&g_data_lock); return; }
+    g_fetch_active = 1;
+    fetch_req_t *req = malloc(sizeof(*req));
+    if (!req) { g_fetch_active = 0; pthread_mutex_unlock(&g_data_lock); return; }
+    req->idx = idx;
+    snprintf(req->name, sizeof(req->name), "%s", g_locations[idx].name);
+    snprintf(req->lat_lon, sizeof(req->lat_lon), "%s", g_locations[idx].lat_lon);
+    pthread_mutex_unlock(&g_data_lock);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, fetch_worker, req) == 0) {
+        pthread_detach(t);
+    } else {
+        free(req);
+        pthread_mutex_lock(&g_data_lock);
+        g_fetch_active = 0;
+        pthread_mutex_unlock(&g_data_lock);
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -827,21 +953,37 @@ static int fetch_weather_for_location(int loc_idx) {
  * ----------------------------------------------------------------------- */
 
 static void show_about(void) {
-    pakkit_info_pair info[] = {
-        {.key = "Version",.value = NIMBUS_VERSION },
-        {.key = "Platform",.value = CAT_PLATFORM_NAME },
-        {.key = "UI",.value = "Catastrophe" },
-        {.key = "Data",.value = "Open-Meteo" },
-        {.key = "License",.value = "MIT" },
+    cat_detail_info_pair info[] = {
+        { .key = "Version",  .value = NIMBUS_VERSION },
+        { .key = "Platform", .value = CAT_PLATFORM_NAME },
+        { .key = "UI",       .value = "Catastrophe" },
+        { .key = "Data",     .value = "Open-Meteo" },
+        { .key = "License",  .value = "MIT" },
     };
-    const char *credits[] = {
-        "Nimbus by Eric Reinsmidt",
-        "Built with Catastrophe for Leaf",
-        "Weather data by Open-Meteo (CC-BY 4.0)",
+    cat_detail_section sections[] = {
+        { .type = CAT_SECTION_DESCRIPTION, .description = "Weather app for Leaf" },
+        { .type = CAT_SECTION_INFO, .title = "Info",
+          .info_pairs = info, .info_count = 5 },
+        { .type = CAT_SECTION_DESCRIPTION, .title = "Credits",
+          .description = "Nimbus by Eric Reinsmidt\n"
+                         "Built with Catastrophe for Leaf\n"
+                         "Weather data by Open-Meteo (CC-BY 4.0)\n"
+                         "Weather Icons by Erik Flowers (OFL 1.1)" },
     };
-    pakkit_detail_opts opts = {.title = "Nimbus",.subtitle = "Weather app for Leaf",.info = info,.info_count = 5,.credits = credits,.credit_count = 3,
+    cat_footer_item footer[] = { { .button = CAT_BTN_B, .label = "Back" } };
+    cat_theme *theme = cat_get_theme();
+    cat_detail_opts opts = {
+        .title = "Nimbus",
+        .sections = sections,
+        .section_count = 3,
+        .footer = footer,
+        .footer_count = NB_HINTS(1),
+        /* Section headers ("Info"/"Credits") default to a faint accent; use the
+           saturated theme color (highlight) so they read darker but stay on-theme. */
+        .section_title_color = &theme->highlight,
     };
-    pakkit_detail_screen(&opts);
+    cat_detail_result res;
+    cat_detail_screen(&opts, &res);
 }
 
 /* -----------------------------------------------------------------------
@@ -881,7 +1023,7 @@ static int search_locations(const char *query, search_result_t *results, int max
         "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=%d&language=en&format=json",
         enc, max_results > 0 ? max_results : 10);
 
-    pakkit_loading("Searching...");
+    nb_loading("Searching...");
     fetch_buf_t buf;
     if (fetch_url(url, &buf) != 0) return 0;
     cJSON *root = cJSON_Parse(buf.data);
@@ -919,21 +1061,21 @@ static int search_and_add_location(void) {
     if (g_location_count >= MAX_LOCATIONS) {
         char msg[64];
         snprintf(msg, sizeof(msg), "Maximum of %d locations reached.", MAX_LOCATIONS);
-        pakkit_message(msg, "OK");
+        nb_message(msg, "OK");
         return -1;
     }
-    pakkit_keyboard_opts kb_opts = {.prompt = "City, zip, or postal code" };
-    pakkit_keyboard_result kb_result;
-    int rc = pakkit_keyboard("", &kb_opts, &kb_result);
+    cat_keyboard_result kb_result;
+    int rc = cat_keyboard("", "City, zip, or postal code", CAT_KB_GENERAL, &kb_result);
     if (rc != CAT_OK || kb_result.text[0] == '\0') return -1;
     search_result_t results[MAX_SEARCH_RESULTS];
     int count = search_locations(kb_result.text, results, MAX_SEARCH_RESULTS);
     if (count == 0) {
-        pakkit_message("No locations found.\nTry a different search.", "OK");
+        nb_message("No locations found.\nTry a different search.", "OK");
         return -1;
     }
     static char result_labels[MAX_SEARCH_RESULTS][512];
-    pakkit_list_item items[MAX_SEARCH_RESULTS];
+    cat_list_item items[MAX_SEARCH_RESULTS];
+    memset(items, 0, sizeof(items));
     for (int i = 0; i < count; i++) {
         if (results[i].region[0])
             snprintf(result_labels[i], sizeof(result_labels[i]), "%s, %s, %s",
@@ -943,15 +1085,15 @@ static int search_and_add_location(void) {
                      results[i].name, results[i].country);
         items[i].label = result_labels[i];
     }
-    pakkit_hint hints[] = {
-        {.button = "B",.label = "Cancel" },
-        {.button = "A",.label = "Select" },
+    cat_footer_item footer[] = {
+        { .button = CAT_BTN_B, .label = "Cancel" },
+        { .button = CAT_BTN_A, .label = "Select", .is_confirm = true },
     };
-    pakkit_list_opts opts = {.title = "Select Location",.hints = hints,.hint_count = 2,.secondary_button = CAT_BTN_NONE,.tertiary_button = CAT_BTN_NONE,
-    };
-    pakkit_list_result result;
-    rc = pakkit_list(&opts, items, count, &result);
-    if (rc != CAT_OK || result.selected_index < 0) return -1;
+    cat_list_opts opts = cat_list_default_opts("Select Location", items, count);
+    opts.footer = footer;
+    opts.footer_count = NB_HINTS(2);
+    cat_list_result result;
+    if (cat_list(&opts, &result) != CAT_OK || result.selected_index < 0) return -1;
     search_result_t *sel = &results[result.selected_index];
     location_t *loc = &g_locations[g_location_count];
     memset(loc, 0, sizeof(*loc));
@@ -972,14 +1114,20 @@ static void show_location_options(int loc_idx) {
     if (loc_idx < 0 || loc_idx >= g_location_count) return;
     char title[256];
     snprintf(title, sizeof(title), "%s", g_locations[loc_idx].name);
-    int item_count = 2;
-    pakkit_menu_item items[2];
-    items[0] = (pakkit_menu_item){.label = "Set as Home" };
-    items[1] = (pakkit_menu_item){.label = "Delete" };
-    if (g_location_count <= 1) item_count = 1;
-    pakkit_menu_result result;
-    int rc = pakkit_menu(title, items, item_count, &result);
-    if (rc != CAT_OK) return;
+    cat_list_item items[2];
+    memset(items, 0, sizeof(items));
+    items[0].label = "Set as Home";
+    items[1].label = "Delete";
+    int item_count = (g_location_count <= 1) ? 1 : 2;
+    cat_footer_item footer[] = {
+        { .button = CAT_BTN_B, .label = "Back" },
+        { .button = CAT_BTN_A, .label = "Select", .is_confirm = true },
+    };
+    cat_list_opts opts = cat_list_default_opts(title, items, item_count);
+    opts.footer = footer;
+    opts.footer_count = NB_HINTS(2);
+    cat_list_result result;
+    if (cat_list(&opts, &result) != CAT_OK) return;
     switch (result.selected_index) {
         case 0:
             for (int i = 0; i < g_location_count; i++) g_locations[i].is_home = 0;
@@ -989,7 +1137,7 @@ static void show_location_options(int loc_idx) {
         case 1: {
             char msg[256];
             snprintf(msg, sizeof(msg), "Delete \"%s\"?", g_locations[loc_idx].name);
-            if (pakkit_confirm(msg, "Delete", "Cancel")) {
+            if (nb_confirm(msg, "Delete", "Cancel")) {
                 int was_home = g_locations[loc_idx].is_home;
                 free_weather_textures(&g_weather_cache[loc_idx]);
                 for (int i = loc_idx; i < g_location_count - 1; i++) {
@@ -1009,9 +1157,11 @@ static void show_location_options(int loc_idx) {
 }
 
 static void show_locations(void) {
+    int focus = 0;
     while (1) {
         static char loc_labels[MAX_LOCATIONS][MAX_LOCATION + 16];
-        pakkit_list_item items[MAX_LOCATIONS];
+        cat_list_item items[MAX_LOCATIONS];
+        memset(items, 0, sizeof(items));
         for (int i = 0; i < g_location_count; i++) {
             if (g_locations[i].is_home)
                 snprintf(loc_labels[i], sizeof(loc_labels[i]), "%s (Home)", g_locations[i].name);
@@ -1019,18 +1169,23 @@ static void show_locations(void) {
                 snprintf(loc_labels[i], sizeof(loc_labels[i]), "%s", g_locations[i].name);
             items[i].label = loc_labels[i];
         }
-        pakkit_hint hints[] = {
-            {.button = "B",.label = "Back" },
-            {.button = "X",.label = "Add" },
-            {.button = "A",.label = "Options" },
+        cat_footer_item footer[] = {
+            { .button = CAT_BTN_B, .label = "Back" },
+            { .button = CAT_BTN_X, .label = "Add" },
+            { .button = CAT_BTN_A, .label = "Options", .is_confirm = true },
         };
-        pakkit_list_opts opts = {.title = "Locations",.hints = hints,.hint_count = 3,.secondary_button = CAT_BTN_X,.tertiary_button = CAT_BTN_NONE,
-        };
-        pakkit_list_result result;
-        pakkit_list(&opts, items, g_location_count, &result);
-        if (result.action == PAKKIT_ACTION_BACK) return;
-        if (result.action == PAKKIT_ACTION_SECONDARY) { search_and_add_location(); continue; }
-        if (result.selected_index >= 0) show_location_options(result.selected_index);
+        cat_list_opts opts = cat_list_default_opts("Locations", items, g_location_count);
+        opts.footer = footer;
+        opts.footer_count = NB_HINTS(3);
+        opts.secondary_action_button = CAT_BTN_X;
+        opts.initial_index = focus;
+        cat_list_result result;
+        cat_list(&opts, &result);
+        if (result.selected_index >= 0) focus = result.selected_index;
+        if (result.action == CAT_ACTION_BACK) return;
+        if (result.action == CAT_ACTION_SECONDARY_TRIGGERED) { search_and_add_location(); continue; }
+        if (result.action == CAT_ACTION_SELECTED && result.selected_index >= 0)
+            show_location_options(result.selected_index);
     }
 }
 
@@ -1039,23 +1194,52 @@ static void show_locations(void) {
  * ----------------------------------------------------------------------- */
 
 static void show_settings(void) {
+    int focus = 0;
     while (1) {
-        char units_label[32];
-        snprintf(units_label, sizeof(units_label), "Units: %s",
-                 g_settings.use_fahrenheit ? "\xc2\xb0""F" : "\xc2\xb0""C");
-        pakkit_menu_item items[] = {
-            {.label = units_label },
-            {.label = "Locations" },
-            {.label = "About" },
+        /* Units is a cycleable option (Left/Right or A); Locations/About are
+           navigation rows (A opens them). Native cat_options_list. */
+        cat_option unit_opts[] = {
+            { .label = "Fahrenheit", .value = "\xc2\xb0""F" },
+            { .label = "Celsius",    .value = "\xc2\xb0""C" },
         };
-        pakkit_menu_result result;
-        pakkit_menu("Settings", items, 3, &result);
-        if (result.selected_index < 0) return;   /* B cancels out of Settings */
-        switch (result.selected_index) {
-            case 0: g_settings.use_fahrenheit = !g_settings.use_fahrenheit; settings_save(); break;
-            case 1: show_locations(); break;
-            case 2: show_about(); break;
+        cat_options_item items[3];
+        memset(items, 0, sizeof(items));
+        items[0].label = "Units";
+        items[0].type = CAT_OPT_STANDARD;
+        items[0].options = unit_opts;
+        items[0].option_count = 2;
+        items[0].selected_option = g_settings.use_fahrenheit ? 0 : 1;
+        items[1].label = "Locations";
+        items[1].type = CAT_OPT_CLICKABLE;
+        items[2].label = "About";
+        items[2].type = CAT_OPT_CLICKABLE;
+
+        cat_footer_item footer[] = {
+            { .button = CAT_BTN_B, .label = "Back" },
+            { .button = CAT_BTN_A, .label = "Select", .is_confirm = true },
+        };
+        cat_options_list_opts opts = {
+            .title = "Settings",
+            .items = items,
+            .item_count = 3,
+            .footer = footer,
+            .footer_count = NB_HINTS(2),
+            .initial_selected_index = focus,
+        };
+        cat_options_list_result res;
+        cat_options_list(&opts, &res);
+        focus = res.focused_index;
+
+        /* Commit Units from the (possibly cycled) standard option. */
+        g_settings.use_fahrenheit = (items[0].selected_option == 0) ? 1 : 0;
+        settings_save();
+
+        if (res.action == CAT_ACTION_SELECTED) {
+            if (res.focused_index == 1) show_locations();
+            else if (res.focused_index == 2) show_about();
+            continue;
         }
+        return;   /* B / back closes Settings */
     }
 }
 
@@ -1063,177 +1247,303 @@ static void show_settings(void) {
  * Weather screen: tab drawing helpers
  * ----------------------------------------------------------------------- */
 
+/* Draw text horizontally centered on cx. */
+static void draw_centered_text(TTF_Font *f, const char *s, int cx, int y, cat_draw_color col) {
+    int w = cat_measure_text(f, s);
+    cat_draw_text(f, s, cx - w / 2, y, col);
+}
+
+/* ── Nimbus type scale ───────────────────────────────────────────────────
+   We inherit Leaf's font *family* but set our own sizes: the CAT_FONT_* tiers
+   are just presets (EXTRA_LARGE = 24 base = 48px on MLP1). A handheld you glance
+   at wants big, chunky type, so Nimbus carries its own larger ladder. Sizes are
+   "base" units (× device_scale at runtime, exactly like the tiers), opened from
+   the active theme font and cached by (path, px). */
+#define NB_SZ_TEMP   78   /* hero temperature           (~156px on MLP1) */
+#define NB_SZ_GLYPH  92   /* weather glyph centerpiece  (~184px) */
+#define NB_SZ_COND   30   /* condition line             (~60px) */
+#define NB_SZ_VALUE  28   /* stat value                 (~56px) */
+#define NB_SZ_LABEL  17   /* stat / feels-like caption  (~34px) */
+
+#define NB_FONT_CACHE 16
+static struct { char path[512]; int px; TTF_Font *f; } nb_fcache[NB_FONT_CACHE];
+static int nb_fcache_n = 0;
+
+/* Open `path` at the resolution-scaled size for `base`, cached for the process
+   lifetime (no per-frame re-open). Returns NULL if the file can't be opened. */
+static TTF_Font *nb_open_font(const char *path, int base) {
+    if (!path || !path[0]) return NULL;
+    int px = cat_font_size_for_resolution(base);
+    for (int i = 0; i < nb_fcache_n; i++)
+        if (nb_fcache[i].px == px && strcmp(nb_fcache[i].path, path) == 0)
+            return nb_fcache[i].f;
+    TTF_Font *f = TTF_OpenFont(path, px);
+    if (!f) return NULL;
+    if (nb_fcache_n < NB_FONT_CACHE) {
+        int i = nb_fcache_n++;
+        snprintf(nb_fcache[i].path, sizeof(nb_fcache[i].path), "%s", path);
+        nb_fcache[i].px = px;
+        nb_fcache[i].f = f;
+    }
+    return f;
+}
+
+/* Theme UI font at a Nimbus size (falls back to the nearest tier if the theme
+   font path is unavailable, e.g. desktop dev without a Leaf snapshot). */
+static TTF_Font *nb_font(int base) {
+    cat_theme *th = cat_get_theme();
+    TTF_Font *f = nb_open_font(th->font_path, base);
+    return f ? f : cat_get_font(CAT_FONT_EXTRA_LARGE);
+}
+
+/* Weather Icons glyph font (bundled in res/fonts). NULL if missing. */
+static TTF_Font *nb_glyph_font(int base) {
+    static char path[512] = {0};
+    if (!path[0]) {
+        const char *pak = getenv("NIMBUS_PAK_DIR");
+        if (pak) snprintf(path, sizeof(path), "%s/res/fonts/weathericons.ttf", pak);
+        else     snprintf(path, sizeof(path), "res/fonts/weathericons.ttf");
+    }
+    return nb_open_font(path, base);
+}
+
+/* UTF-8 encode a codepoint into one of a few rotating buffers (so two glyphs
+   can be live at once). */
+static const char *nb_utf8(unsigned cp) {
+    static char bufs[4][5];
+    static int slot = 0;
+    slot = (slot + 1) & 3;
+    char *b = bufs[slot];
+    if (cp < 0x80) { b[0] = (char)cp; b[1] = 0; }
+    else if (cp < 0x800) {
+        b[0] = (char)(0xC0 | (cp >> 6)); b[1] = (char)(0x80 | (cp & 0x3F)); b[2] = 0;
+    } else {
+        b[0] = (char)(0xE0 | (cp >> 12));
+        b[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        b[2] = (char)(0x80 | (cp & 0x3F));
+        b[3] = 0;
+    }
+    return b;
+}
+
+/* WMO weather code (+ day/night) -> Weather Icons glyph codepoint. */
+static unsigned wmo_glyph_cp(int code, int is_day) {
+    switch (code) {
+        case 0:  case 1:  return is_day ? 0xF00D : 0xF02E; /* clear */
+        case 2:           return is_day ? 0xF002 : 0xF086; /* partly cloudy */
+        case 3:           return 0xF013;                   /* overcast */
+        case 45: case 48: return is_day ? 0xF003 : 0xF04A; /* fog */
+        case 51: case 53: case 55: return is_day ? 0xF00B : 0xF01C; /* drizzle */
+        case 56: case 57: return 0xF0B5;                   /* freezing drizzle */
+        case 61: case 63: case 65: return is_day ? 0xF008 : 0xF028; /* rain */
+        case 66: case 67: return 0xF0B5;                   /* freezing rain */
+        case 71: case 73: case 75: case 77: return is_day ? 0xF00A : 0xF01B; /* snow */
+        case 80: case 81: case 82: return is_day ? 0xF009 : 0xF01A; /* rain showers */
+        case 85: case 86: return is_day ? 0xF00A : 0xF01B; /* snow showers */
+        case 95:          return is_day ? 0xF010 : 0xF01E; /* thunderstorm */
+        case 96: case 99: return 0xF01E;                   /* thunderstorm + hail */
+        default:          return 0xF07B;                   /* n/a */
+    }
+}
+
+/* Moon-phase name -> Weather Icons moon glyph codepoint. */
+static unsigned moon_glyph_cp(const char *phase) {
+    if (!phase) return 0xF0A3;
+    if (strstr(phase, "New"))            return 0xF095;
+    if (strstr(phase, "Waxing Crescent"))return 0xF098;
+    if (strstr(phase, "First"))          return 0xF09C;
+    if (strstr(phase, "Waxing Gibbous")) return 0xF09F;
+    if (strstr(phase, "Full"))           return 0xF0A3;
+    if (strstr(phase, "Waning Gibbous")) return 0xF0A6;
+    if (strstr(phase, "Last"))           return 0xF0AA;
+    if (strstr(phase, "Waning Crescent"))return 0xF0AD;
+    return 0xF0A3;
+}
+
+/* Draw a glyph centered on (cx, cy) both horizontally and vertically; no-op if
+   the glyph font is missing. */
+static void draw_glyph_mid(unsigned cp, int base, int cx, int cy, cat_draw_color col) {
+    TTF_Font *gf = nb_glyph_font(base);
+    if (!gf) return;
+    const char *g = nb_utf8(cp);
+    int w = cat_measure_text(gf, g);
+    cat_draw_text(gf, g, cx - w / 2, cy - TTF_FontHeight(gf) / 2, col);
+}
+
+/* Current tab — big, glanceable hero for a handheld: a large weather glyph
+   beside a huge temperature, the condition and feels-like below, then one row
+   of oversized stats. Built on the Nimbus type scale above. */
 static void draw_tab_current(weather_data_t *weather, int content_y, int content_h,
                               int scroll_y, int *total_h) {
     int sw = cat_get_screen_width();
-    int pad = CAT_DS(5);
+    int cx = sw / 2;
 
-    TTF_Font *font_xl    = cat_get_font(CAT_FONT_EXTRA_LARGE);
-    TTF_Font *font_med   = cat_get_font(CAT_FONT_MEDIUM);
-    TTF_Font *font_small = cat_get_font(CAT_FONT_SMALL);
+    TTF_Font *f_temp  = nb_font(NB_SZ_TEMP);
+    TTF_Font *f_cond  = nb_font(NB_SZ_COND);
+    TTF_Font *f_cap   = nb_font(NB_SZ_LABEL);
+    TTF_Font *f_val   = nb_font(NB_SZ_VALUE);
+    TTF_Font *f_glyph = nb_glyph_font(NB_SZ_GLYPH);
 
     cat_theme *theme = cat_get_theme();
     cat_draw_color text_color = theme->text;
     cat_draw_color hint_color = theme->hint;
+    cat_draw_color glyph_color = theme->highlight;
 
-    int y = content_y - scroll_y;
+    int y = content_y - scroll_y + CAT_DS(6);
 
-    /* Icon + Temperature */
-    int icon_size = CAT_DS(64);
-    int icon_x = pad * 3;
-    if (weather->icon_texture)
-        cat_draw_image(weather->icon_texture, icon_x, y, icon_size, icon_size);
-
+    /* Glyph + temperature, centered together on one row. */
     char temp_str[32];
+    snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0",
+             g_settings.use_fahrenheit ? weather->temp_f : weather->temp_c);
+
+    const char *glyph = f_glyph
+        ? nb_utf8(wmo_glyph_cp(weather->condition_code, weather->is_day)) : NULL;
+    int gap     = CAT_DS(10);
+    int glyph_w = glyph ? cat_measure_text(f_glyph, glyph) + gap : 0;
+    int temp_w  = cat_measure_text(f_temp, temp_str);
+    int gx      = cx - (glyph_w + temp_w) / 2;
+
+    /* Row advances by the temperature height only. The Weather Icons font has
+       very tall internal metrics, so its glyph box is centered on the same row
+       center as the temperature and its empty padding overflows into the
+       surrounding whitespace (invisible) — using its line height as row_h would
+       inflate the hero ~2x and push the stats off the bottom. */
+    int temp_h  = TTF_FontHeight(f_temp);
+    int glyph_h = glyph ? TTF_FontHeight(f_glyph) : 0;
+    int row_h   = temp_h;
+    int row_cy  = y + row_h / 2;
+
+    if (glyph) {
+        cat_draw_text(f_glyph, glyph, gx, row_cy - glyph_h / 2, glyph_color);
+        gx += glyph_w;
+    }
+    cat_draw_text(f_temp, temp_str, gx, row_cy - temp_h / 2, text_color);
+    y += row_h + CAT_DS(8);
+
+    /* Condition + feels-like, centered. */
+    draw_centered_text(f_cond, weather->condition_text, cx, y, text_color);
+    y += TTF_FontHeight(f_cond) + CAT_DS(2);
+
+    char feels_str[40];
+    snprintf(feels_str, sizeof(feels_str), "Feels like %.0f\xc2\xb0",
+             g_settings.use_fahrenheit ? weather->feels_like_f : weather->feels_like_c);
+    draw_centered_text(f_cap, feels_str, cx, y, hint_color);
+    y += TTF_FontHeight(f_cap);
+
+    /* One row of four oversized stats. */
+    struct { char value[24]; const char *label; } stats[4];
+    snprintf(stats[0].value, sizeof(stats[0].value), "%d%%", weather->humidity);
+    stats[0].label = "Humidity";
+    snprintf(stats[1].value, sizeof(stats[1].value), "%.0f %s",
+             g_settings.use_fahrenheit ? weather->wind_mph : weather->wind_kph, weather->wind_dir);
+    stats[1].label = g_settings.use_fahrenheit ? "Wind mph" : "Wind kmh";
     if (g_settings.use_fahrenheit)
-        snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0""F", weather->temp_f);
+        snprintf(stats[2].value, sizeof(stats[2].value), "%.2f\"", weather->precip_in);
     else
-        snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0""C", weather->temp_c);
+        snprintf(stats[2].value, sizeof(stats[2].value), "%.1fmm", weather->precip_mm);
+    stats[2].label = "Precip";
+    snprintf(stats[3].value, sizeof(stats[3].value), "%.0f", weather->uv);
+    stats[3].label = "UV Index";
 
-    int temp_x = icon_x + icon_size + pad * 2;
-    int temp_y = y + (icon_size / 2) - TTF_FontHeight(font_xl) / 2 - pad;
-    cat_draw_text(font_xl, temp_str, temp_x, temp_y, text_color);
-    int cond_y = temp_y + TTF_FontHeight(font_xl) + 2;
-    cat_draw_text(font_med, weather->condition_text, temp_x, cond_y, hint_color);
-    y += icon_size + pad * 2;
+    /* Pin the stat row to the bottom of the content area so it's always fully
+       on screen under the big hero (no hidden scroll). Calm whitespace sits
+       between "Feels like" and the stats. */
+    int val_h = TTF_FontHeight(f_val), lbl_h = TTF_FontHeight(f_cap);
+    int stat_block = val_h + CAT_DS(2) + lbl_h;
+    int stat_y = content_y + content_h - stat_block - CAT_DS(10);
+    if (stat_y < y + CAT_DS(12)) stat_y = y + CAT_DS(12);  /* never overlap the hero */
 
-    /* Divider */
-    cat_draw_rect(pad * 3, y, sw - pad * 6, 1, hint_color);
-    y += pad * 2;
-
-    /* Details */
-    int col1_x = pad * 3;
-    int col2_x = sw / 2 + pad;
-    int row_h = TTF_FontHeight(font_small) + pad;
-
-    char feels_str[32], humidity_str[32], wind_str[64];
-    char precip_str[32], cloud_str[32], uv_str[32];
-
-    if (g_settings.use_fahrenheit) {
-        snprintf(feels_str, sizeof(feels_str), "Feels like %.0f\xc2\xb0""F", weather->feels_like_f);
-        snprintf(wind_str, sizeof(wind_str), "Wind: %.0f mph %s", weather->wind_mph, weather->wind_dir);
-        snprintf(precip_str, sizeof(precip_str), "Precip: %.2f in", weather->precip_in);
-    } else {
-        snprintf(feels_str, sizeof(feels_str), "Feels like %.0f\xc2\xb0""C", weather->feels_like_c);
-        snprintf(wind_str, sizeof(wind_str), "Wind: %.0f km/h %s", weather->wind_kph, weather->wind_dir);
-        snprintf(precip_str, sizeof(precip_str), "Precip: %.1f mm", weather->precip_mm);
-    }
-    snprintf(humidity_str, sizeof(humidity_str), "Humidity: %d%%", weather->humidity);
-    snprintf(cloud_str, sizeof(cloud_str), "Cloud: %d%%", weather->cloud);
-    snprintf(uv_str, sizeof(uv_str), "UV: %.0f", weather->uv);
-
-    cat_draw_text(font_small, feels_str, col1_x, y, text_color);
-    cat_draw_text(font_small, humidity_str, col2_x, y, text_color);
-    y += row_h;
-    cat_draw_text(font_small, wind_str, col1_x, y, text_color);
-    cat_draw_text(font_small, cloud_str, col2_x, y, text_color);
-    y += row_h;
-    cat_draw_text(font_small, precip_str, col1_x, y, text_color);
-    cat_draw_text(font_small, uv_str, col2_x, y, text_color);
-    y += row_h;
-
-    /* Sunrise / Sunset */
-    if (weather->forecast_count > 0) {
-        forecast_day_t *today = &weather->forecast[0];
-        if (today->sunrise[0] && today->sunset[0]) {
-            int sun_icon_size = TTF_FontHeight(font_small);
-            int text_offset = sun_icon_size + pad;
-            if (g_sunrise_icon)
-                cat_draw_image(g_sunrise_icon, col1_x, y, sun_icon_size, sun_icon_size);
-            cat_draw_text(font_small, today->sunrise, col1_x + text_offset, y, text_color);
-            if (g_sunset_icon)
-                cat_draw_image(g_sunset_icon, col2_x, y, sun_icon_size, sun_icon_size);
-            cat_draw_text(font_small, today->sunset, col2_x + text_offset, y, text_color);
-            y += row_h;
-        }
+    int margin = CAT_DS(16);
+    int col_w  = (sw - margin * 2) / 4;
+    for (int i = 0; i < 4; i++) {
+        int scx = margin + col_w * i + col_w / 2;
+        draw_centered_text(f_val, stats[i].value[0] ? stats[i].value : "\xe2\x80\x94", scx, stat_y, text_color);
+        draw_centered_text(f_cap, stats[i].label, scx, stat_y + val_h + CAT_DS(2), hint_color);
     }
 
-    y += pad * 2;
-
-    *total_h = y + scroll_y - content_y;
+    /* Content fits the viewport — no scrolling on Current. */
+    *total_h = content_h;
 }
 
 static void draw_tab_forecast(weather_data_t *weather, int content_y, int content_h,
                                int scroll_y, int *total_h) {
     int sw = cat_get_screen_width();
-    int pad = CAT_DS(5);
 
-    TTF_Font *font_med   = cat_get_font(CAT_FONT_MEDIUM);
-    TTF_Font *font_small = cat_get_font(CAT_FONT_SMALL);
-    TTF_Font *font_tiny  = cat_get_font(CAT_FONT_TINY);
+    TTF_Font *f_day  = nb_font(NB_SZ_COND);   /* day name */
+    TTF_Font *f_cap  = nb_font(NB_SZ_LABEL);  /* condition / rain */
+    TTF_Font *f_temp = nb_font(NB_SZ_VALUE);  /* hi / lo */
 
     cat_theme *theme = cat_get_theme();
     cat_draw_color text_color = theme->text;
     cat_draw_color hint_color = theme->hint;
+    cat_draw_color glyph_color = theme->highlight;
 
-    int y = content_y - scroll_y;
-    int col1_x = pad * 3;
+    int n = weather->forecast_count;
+    int margin    = CAT_DS(18);
+    int glyph_base = NB_SZ_COND + 8;          /* a touch bigger than the day text */
+    int glyph_cx  = margin + CAT_DS(26);
+    int text_x    = margin + CAT_DS(58);
+    int row_h     = CAT_DS(78);               /* chunky fixed rows */
 
-    /* Section title */
-    cat_draw_text(font_med, "3-Day Forecast", col1_x, y, hint_color);
-    y += TTF_FontHeight(font_med) + pad * 2;
+    int y = content_y - scroll_y + CAT_DS(4);
+    int day_h = TTF_FontHeight(f_day), cap_h = TTF_FontHeight(f_cap), temp_h = TTF_FontHeight(f_temp);
 
-    int fc_icon_size = CAT_DS(40);
-    for (int i = 0; i < weather->forecast_count; i++) {
+    for (int i = 0; i < n; i++) {
         forecast_day_t *day = &weather->forecast[i];
-        char day_label[64];
-        if (i == 0) snprintf(day_label, sizeof(day_label), "Today");
-        else snprintf(day_label, sizeof(day_label), "%s", day->day_name);
-        int row_top = y;
-        if (day->icon_texture)
-            cat_draw_image(day->icon_texture, col1_x, y, fc_icon_size, fc_icon_size);
-        int text_x = col1_x + fc_icon_size + pad * 2;
-        char line1[128];
-        snprintf(line1, sizeof(line1), "%s  %s", day_label, day->condition_text);
-        cat_draw_text(font_small, line1, text_x, y, text_color);
-        y += TTF_FontHeight(font_small) + 2;
+        int cy = y + row_h / 2;
 
-        char line2[128];
-        if (g_settings.use_fahrenheit)
-            snprintf(line2, sizeof(line2), "H:%.0f\xc2\xb0  L:%.0f\xc2\xb0  Rain:%d%%",
-                     day->max_temp_f, day->min_temp_f, day->chance_rain);
-        else
-            snprintf(line2, sizeof(line2), "H:%.0f\xc2\xb0  L:%.0f\xc2\xb0  Rain:%d%%",
-                     day->max_temp_c, day->min_temp_c, day->chance_rain);
-        cat_draw_text(font_tiny, line2, text_x, y, hint_color);
+        draw_glyph_mid(wmo_glyph_cp(day->condition_code, 1), glyph_base, glyph_cx, cy, glyph_color);
 
-        int row_bottom = y + TTF_FontHeight(font_tiny);
-        int min_bottom = row_top + fc_icon_size;
-        y = (row_bottom > min_bottom ? row_bottom : min_bottom) + pad;
+        /* Left: day name + condition, vertically centered as a block. */
+        const char *dname = (i == 0) ? "Today" : day->day_name;
+        int lblock = day_h + CAT_DS(2) + cap_h;
+        int ly = y + (row_h - lblock) / 2;
+        cat_draw_text(f_day, dname, text_x, ly, text_color);
+        cat_draw_text_ellipsized(f_cap, day->condition_text, text_x, ly + day_h + CAT_DS(2),
+                                 hint_color, sw / 2 - text_x);
 
-        /* Divider between days */
-        if (i < weather->forecast_count - 1) {
-            cat_draw_rect(pad * 3, y, sw - pad * 6, 1, hint_color);
-            y += pad * 2;
-        }
+        /* Right: high / low + rain, right-aligned and vertically centered. */
+        char hilo[48];
+        snprintf(hilo, sizeof(hilo), "%.0f\xc2\xb0 / %.0f\xc2\xb0",
+                 g_settings.use_fahrenheit ? day->max_temp_f : day->max_temp_c,
+                 g_settings.use_fahrenheit ? day->min_temp_f : day->min_temp_c);
+        char rain[24];
+        snprintf(rain, sizeof(rain), "Rain %d%%", day->chance_rain);
+        int rblock = temp_h + CAT_DS(2) + cap_h;
+        int ry = y + (row_h - rblock) / 2;
+        int hilo_w = cat_measure_text(f_temp, hilo);
+        int rain_w = cat_measure_text(f_cap, rain);
+        cat_draw_text(f_temp, hilo, sw - margin - hilo_w, ry, text_color);
+        cat_draw_text(f_cap, rain, sw - margin - rain_w, ry + temp_h + CAT_DS(2), hint_color);
+
+        y += row_h;
+        if (i < n - 1) cat_draw_rect(margin, y, sw - margin * 2, 1, hint_color);
     }
 
-    y += pad * 2;
+    y += CAT_DS(6);
     *total_h = y + scroll_y - content_y;
 }
 
 static void draw_tab_hourly(weather_data_t *weather, int content_y, int content_h,
                              int scroll_y, int *total_h) {
     int sw = cat_get_screen_width();
-    int pad = CAT_DS(5);
 
-    TTF_Font *font_med   = cat_get_font(CAT_FONT_MEDIUM);
-    TTF_Font *font_small = cat_get_font(CAT_FONT_SMALL);
-    TTF_Font *font_tiny  = cat_get_font(CAT_FONT_TINY);
+    TTF_Font *f_hour = nb_font(NB_SZ_LABEL);  /* hour label */
+    TTF_Font *f_temp = nb_font(NB_SZ_VALUE);  /* temp */
+    TTF_Font *f_cap  = nb_font(NB_SZ_LABEL);  /* rain */
 
     cat_theme *theme = cat_get_theme();
     cat_draw_color text_color = theme->text;
     cat_draw_color hint_color = theme->hint;
+    cat_draw_color glyph_color = theme->highlight;
 
-    int y = content_y - scroll_y;
-    int col1_x = pad * 3;
+    int margin     = CAT_DS(18);
+    int glyph_base = NB_SZ_VALUE + 4;
+    int glyph_cx   = margin + CAT_DS(22);
+    int hour_x     = margin + CAT_DS(48);
+    int row_h      = CAT_DS(56);
 
-    /* Section title */
-    cat_draw_text(font_med, "Hourly", col1_x, y, hint_color);
-    y += TTF_FontHeight(font_med) + pad * 2;
-
-    int icon_size = CAT_DS(28);
-    int row_h = icon_size + pad;
+    int y = content_y - scroll_y + CAT_DS(2);
 
     int start_hour = 0;
     if (weather->last_updated[0]) {
@@ -1241,7 +1551,7 @@ static void draw_tab_hourly(weather_data_t *weather, int content_y, int content_
         const char *space = strchr(weather->last_updated, ' ');
         if (space) sscanf(space + 1, "%d", &cur_hour);
         char date_prefix[16] = {0};
-        strncpy(date_prefix, weather->last_updated, 10);
+        snprintf(date_prefix, sizeof(date_prefix), "%.10s", weather->last_updated);
         for (int i = 0; i < weather->hour_count; i++) {
             int h_hour = 0;
             const char *hs = strchr(weather->hours[i].time, ' ');
@@ -1256,144 +1566,111 @@ static void draw_tab_hourly(weather_data_t *weather, int content_y, int content_
     int shown = 0;
     for (int i = start_hour; i < weather->hour_count && shown < 24; i++, shown++) {
         hourly_t *hr = &weather->hours[i];
+        int cy = y + row_h / 2;
 
-        if (hr->icon_texture)
-            cat_draw_image(hr->icon_texture, col1_x, y, icon_size, icon_size);
+        draw_glyph_mid(wmo_glyph_cp(hr->condition_code, hr->is_day), glyph_base,
+                       glyph_cx, cy, glyph_color);
 
-        int text_x = col1_x + icon_size + pad * 2;
-        int text_y = y + (icon_size - TTF_FontHeight(font_small)) / 2;
+        cat_draw_text(f_hour, hr->hour_label, hour_x, cy - TTF_FontHeight(f_hour) / 2, text_color);
 
-        char temp_str[32];
-        if (g_settings.use_fahrenheit)
-            snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0""F", hr->temp_f);
-        else
-            snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0""C", hr->temp_c);
-
-        /* Reserve space for rain % on right */
-        int rain_reserve = CAT_DS(35);
-        int max_text_w = sw - text_x - pad * 3 - rain_reserve;
-
-        char line[128];
-        snprintf(line, sizeof(line), "%-6s  %s  %s", hr->hour_label, temp_str, hr->condition_text);
-        cat_draw_text_ellipsized(font_small, line, text_x, text_y, text_color, max_text_w);
+        char temp_str[16];
+        snprintf(temp_str, sizeof(temp_str), "%.0f\xc2\xb0",
+                 g_settings.use_fahrenheit ? hr->temp_f : hr->temp_c);
+        int rain_reserve = CAT_DS(64);
+        int temp_w = cat_measure_text(f_temp, temp_str);
+        cat_draw_text(f_temp, temp_str, sw - margin - rain_reserve - temp_w,
+                      cy - TTF_FontHeight(f_temp) / 2, text_color);
 
         if (hr->chance_rain > 0) {
             char rain[16];
             snprintf(rain, sizeof(rain), "%d%%", hr->chance_rain);
-            int rain_w = cat_measure_text(font_tiny, rain);
-            cat_draw_text(font_tiny, rain, sw - rain_w - pad * 3,
-                         text_y + (TTF_FontHeight(font_small) - TTF_FontHeight(font_tiny)) / 2,
-                         hint_color);
+            int rain_w = cat_measure_text(f_cap, rain);
+            cat_draw_text(f_cap, rain, sw - margin - rain_w, cy - TTF_FontHeight(f_cap) / 2, hint_color);
         }
 
         y += row_h;
+        if (shown < 23 && i + 1 < weather->hour_count)
+            cat_draw_rect(margin, y, sw - margin * 2, 1, hint_color);
     }
 
     if (shown == 0) {
-        cat_draw_text(font_small, "No hourly data available", pad * 3, y, hint_color);
-        y += TTF_FontHeight(font_small) + pad;
+        cat_draw_text(f_hour, "No hourly data available", margin, y, hint_color);
+        y += TTF_FontHeight(f_hour) + CAT_DS(5);
     }
 
+    y += CAT_DS(6);
     *total_h = y + scroll_y - content_y;
 }
 
 static void draw_tab_astro(weather_data_t *weather, int content_y, int content_h,
                             int scroll_y, int *total_h) {
     int sw = cat_get_screen_width();
-    int pad = CAT_DS(5);
 
-    TTF_Font *font_med   = cat_get_font(CAT_FONT_MEDIUM);
-    TTF_Font *font_small = cat_get_font(CAT_FONT_SMALL);
+    TTF_Font *f_day = nb_font(NB_SZ_COND);    /* day header */
+    TTF_Font *f_val = nb_font(NB_SZ_VALUE);   /* times / phase */
+    TTF_Font *f_cap = nb_font(NB_SZ_LABEL);   /* captions */
 
     cat_theme *theme = cat_get_theme();
     cat_draw_color text_color = theme->text;
     cat_draw_color hint_color = theme->hint;
+    cat_draw_color glyph_color = theme->highlight;
 
-    int y = content_y - scroll_y;
-    int col1_x = pad * 3;
-    int val_x = pad * 3 + CAT_DS(100);
-    int row_h = TTF_FontHeight(font_small) + pad;
+    int margin     = CAT_DS(18);
+    int glyph_base = NB_SZ_VALUE + 8;
+    int day_h = TTF_FontHeight(f_day), val_h = TTF_FontHeight(f_val), cap_h = TTF_FontHeight(f_cap);
 
-    /* Section title */
-    cat_draw_text(font_med, "Sun & Moon", col1_x, y, hint_color);
-    y += TTF_FontHeight(font_med) + pad * 2;
+    int gx_l = margin + CAT_DS(22), tx_l = margin + CAT_DS(48);
+    int gx_r = sw / 2 + CAT_DS(10), tx_r = gx_r + CAT_DS(26);
+
+    int y = content_y - scroll_y + CAT_DS(4);
 
     for (int d = 0; d < weather->forecast_count; d++) {
         forecast_day_t *day = &weather->forecast[d];
 
-        char header[64];
-        if (d == 0) snprintf(header, sizeof(header), "Today  (%s)", day->date);
-        else snprintf(header, sizeof(header), "%s  (%s)", day->day_name, day->date);
-        cat_draw_text(font_small, header, col1_x, y, text_color);
-        y += TTF_FontHeight(font_small) + pad;
+        cat_draw_text(f_day, (d == 0) ? "Today" : day->day_name, margin, y, text_color);
+        y += day_h + CAT_DS(8);
 
-        if (day->sunrise[0]) {
-            int sun_icon_size = TTF_FontHeight(font_small);
-            if (g_sunrise_icon)
-                cat_draw_image(g_sunrise_icon, col1_x, y, sun_icon_size, sun_icon_size);
-            cat_draw_text(font_small, "Sunrise", col1_x + sun_icon_size + pad, y, hint_color);
-            cat_draw_text(font_small, day->sunrise, val_x, y, text_color);
-            y += row_h;
-        }
-        if (day->sunset[0]) {
-            int sun_icon_size = TTF_FontHeight(font_small);
-            if (g_sunset_icon)
-                cat_draw_image(g_sunset_icon, col1_x, y, sun_icon_size, sun_icon_size);
-            cat_draw_text(font_small, "Sunset", col1_x + sun_icon_size + pad, y, hint_color);
-            cat_draw_text(font_small, day->sunset, val_x, y, text_color);
-            y += row_h;
-        }
+        /* Sun: sunrise (left) + sunset (right), big with accent glyphs. */
+        int cy = y + val_h / 2;
+        draw_glyph_mid(0xF051, glyph_base, gx_l, cy, glyph_color);   /* sunrise */
+        cat_draw_text(f_val, day->sunrise[0] ? day->sunrise : "--", tx_l, y, text_color);
+        draw_glyph_mid(0xF052, glyph_base, gx_r, cy, glyph_color);   /* sunset */
+        cat_draw_text(f_val, day->sunset[0] ? day->sunset : "--", tx_r, y, text_color);
+        y += val_h + CAT_DS(4);
 
         if (day->sunrise[0] && day->sunset[0]) {
-            int sr_h = 0, sr_m = 0, ss_h = 0, ss_m = 0;
-            char sr_ampm[4] = {0}, ss_ampm[4] = {0};
-            sscanf(day->sunrise, "%d:%d %2s", &sr_h, &sr_m, sr_ampm);
-            sscanf(day->sunset, "%d:%d %2s", &ss_h, &ss_m, ss_ampm);
-            if (sr_ampm[0] == 'P' && sr_h != 12) sr_h += 12;
-            if (sr_ampm[0] == 'A' && sr_h == 12) sr_h = 0;
-            if (ss_ampm[0] == 'P' && ss_h != 12) ss_h += 12;
-            if (ss_ampm[0] == 'A' && ss_h == 12) ss_h = 0;
-            int sr_mins = sr_h * 60 + sr_m;
-            int ss_mins = ss_h * 60 + ss_m;
-            int day_len = ss_mins - sr_mins;
-            if (day_len > 0) {
-                char daylen[32];
-                snprintf(daylen, sizeof(daylen), "%dh %dm", day_len / 60, day_len % 60);
-                cat_draw_text(font_small, "Day Length", col1_x, y, hint_color);
-                cat_draw_text(font_small, daylen, val_x, y, text_color);
-                y += row_h;
+            int sr_h=0, sr_m=0, ss_h=0, ss_m=0; char sa[4]={0}, ea[4]={0};
+            sscanf(day->sunrise, "%d:%d %2s", &sr_h, &sr_m, sa);
+            sscanf(day->sunset,  "%d:%d %2s", &ss_h, &ss_m, ea);
+            if (sa[0]=='P' && sr_h!=12) sr_h += 12;
+            if (sa[0]=='A' && sr_h==12) sr_h = 0;
+            if (ea[0]=='P' && ss_h!=12) ss_h += 12;
+            if (ea[0]=='A' && ss_h==12) ss_h = 0;
+            int dl = (ss_h*60+ss_m) - (sr_h*60+sr_m);
+            if (dl > 0) {
+                char b[32]; snprintf(b, sizeof(b), "Day length %dh %dm", dl/60, dl%60);
+                cat_draw_text(f_cap, b, tx_l, y, hint_color);
+                y += cap_h + CAT_DS(6);
             }
         }
 
-        y += pad;
-
-        if (day->moonrise[0]) {
-            cat_draw_text(font_small, "Moonrise", col1_x, y, hint_color);
-            cat_draw_text(font_small, day->moonrise, val_x, y, text_color);
-            y += row_h;
-        }
-        if (day->moonset[0]) {
-            cat_draw_text(font_small, "Moonset", col1_x, y, hint_color);
-            cat_draw_text(font_small, day->moonset, val_x, y, text_color);
-            y += row_h;
-        }
+        /* Moon: big phase glyph + name + illumination. */
         if (day->moon_phase[0]) {
-            cat_draw_text(font_small, "Phase", col1_x, y, hint_color);
-            cat_draw_text(font_small, day->moon_phase, val_x, y, text_color);
-            y += row_h;
-        }
-        if (day->moon_illumination > 0) {
-            char illum[16];
-            snprintf(illum, sizeof(illum), "%d%%", day->moon_illumination);
-            cat_draw_text(font_small, "Illumination", col1_x, y, hint_color);
-            cat_draw_text(font_small, illum, val_x, y, text_color);
-            y += row_h;
+            int mcy = y + val_h / 2;
+            draw_glyph_mid(moon_glyph_cp(day->moon_phase), glyph_base, gx_l, mcy, glyph_color);
+            cat_draw_text(f_val, day->moon_phase, tx_l, y, text_color);
+            y += val_h + CAT_DS(2);
+            if (day->moon_illumination > 0) {
+                char b[24]; snprintf(b, sizeof(b), "%d%% illuminated", day->moon_illumination);
+                cat_draw_text(f_cap, b, tx_l, y, hint_color);
+                y += cap_h + CAT_DS(2);
+            }
         }
 
-        y += pad;
+        y += CAT_DS(10);
         if (d < weather->forecast_count - 1) {
-            cat_draw_rect(pad * 3, y, sw - pad * 6, 1, hint_color);
-            y += pad * 2;
+            cat_draw_rect(margin, y, sw - margin * 2, 1, hint_color);
+            y += CAT_DS(12);
         }
     }
 
@@ -1401,39 +1678,21 @@ static void draw_tab_astro(weather_data_t *weather, int content_y, int content_h
 }
 
 /* -----------------------------------------------------------------------
- * Page indicator dots (drawn with circles)
- * ----------------------------------------------------------------------- */
-
-static void draw_page_dots(int count, int active, int x, int y) {
-    cat_theme *theme = cat_get_theme();
-    cat_draw_color active_color = theme->text;
-    cat_draw_color inactive_color = { theme->hint.r, theme->hint.g, theme->hint.b, 80 };
-
-    int dot_r = CAT_DS(3);
-    int dot_spacing = dot_r * 4;
-
-    for (int i = 0; i < count; i++) {
-        int dx = x + i * dot_spacing;
-        cat_draw_color c = (i == active) ? active_color : inactive_color;
-        cat_draw_circle(dx, y + dot_r, dot_r, c);
-    }
-}
-
-/* -----------------------------------------------------------------------
- * Screens: Weather display with page dots
+ * Screens: Weather display
  * ----------------------------------------------------------------------- */
 
 /* Leaf-style tab band: the four weather tabs in a centered row, the active one
-   in a theme highlight pill (matches the launcher's tab look). Returns the y
-   just below the band. */
+   in a theme selection pill drawn with cat_draw_pill so it honors the theme's
+   pill geometry (radius ratio / corner mask), exactly like the launcher. Returns
+   the y just below the band. */
 static int draw_tab_band(int active, int top) {
     static const char *labels[TAB_COUNT] = { "Current", "Forecast", "Hourly", "Astro" };
     cat_theme *th = cat_get_theme();
-    TTF_Font *f = cat_get_font(CAT_FONT_MEDIUM);
+    TTF_Font *f = nb_font(NB_SZ_LABEL);
     int sw = cat_get_screen_width();
-    int xpad = CAT_DS(8), gap = CAT_DS(8);
+    int xpad = CAT_DS(12), gap = CAT_DS(8);
     int fh = TTF_FontHeight(f);
-    int pill_h = fh + CAT_DS(8);
+    int pill_h = fh + CAT_DS(10);
 
     int widths[TAB_COUNT], total = gap * (TAB_COUNT - 1);
     for (int i = 0; i < TAB_COUNT; i++) {
@@ -1444,7 +1703,7 @@ static int draw_tab_band(int active, int top) {
     for (int i = 0; i < TAB_COUNT; i++) {
         bool sel = (i == active);
         if (sel)
-            cat_draw_rounded_rect(x, top, widths[i], pill_h, pill_h / 2, th->highlight);
+            cat_draw_pill(x, top, widths[i], pill_h, th->highlight);
         cat_draw_text(f, labels[i], x + xpad, top + (pill_h - fh) / 2,
                       sel ? th->highlighted_text : th->hint);
         x += widths[i] + gap;
@@ -1454,12 +1713,10 @@ static int draw_tab_band(int active, int top) {
 
 static void show_weather_screen(void) {
     int running = 1;
-    pakkit_scroll_state scroll = {0};
+    nb_scroll_state scroll = {0};
     int active_page = TAB_CURRENT;
 
     while (running) {
-        weather_data_t *weather = &g_weather_cache[g_current_location];
-
         cat_input_event ev;
         while (cat_poll_input(&ev)) {
             if (ev.pressed) {
@@ -1470,83 +1727,52 @@ static void show_weather_screen(void) {
                     case CAT_BTN_Y:
                         if (!ev.repeated) {
                             show_settings();
-                            if (g_location_count > 0) {
-                                if (g_current_location >= g_location_count)
-                                    g_current_location = get_home_index();
-                                if (check_wifi()) {
-                                    fetch_weather_for_location(g_current_location);
-                                } else {
-                                    load_weather_from_cache(g_current_location);
-                                }
-                            }
-                            scroll = (pakkit_scroll_state){0};
+                            if (g_location_count > 0 && g_current_location >= g_location_count)
+                                g_current_location = get_home_index();
+                            pthread_mutex_lock(&g_data_lock);
+                            if (!g_weather_cache[g_current_location].valid)
+                                load_weather_from_cache(g_current_location);
+                            pthread_mutex_unlock(&g_data_lock);
+                            request_refresh(g_current_location);
+                            scroll = (nb_scroll_state){0};
                         }
                         break;
                     case CAT_BTN_L1:
                         if (!ev.repeated) {
                             active_page--;
                             if (active_page < 0) active_page = TAB_COUNT - 1;
-                            scroll = (pakkit_scroll_state){0};
+                            scroll = (nb_scroll_state){0};
                         }
                         break;
                     case CAT_BTN_R1:
                         if (!ev.repeated) {
                             active_page++;
                             if (active_page >= TAB_COUNT) active_page = 0;
-                            scroll = (pakkit_scroll_state){0};
+                            scroll = (nb_scroll_state){0};
                         }
                         break;
                     case CAT_BTN_LEFT:
-                        if (!ev.repeated && g_location_count > 1) {
-                            int next = g_current_location - 1;
-                            if (next < 0) next = g_location_count - 1;
-                            /* Try network fetch first, fall back to cache */
-                            if (check_wifi()) {
-                                free_weather_textures(&g_weather_cache[next]);
-                                memset(&g_weather_cache[next], 0, sizeof(weather_data_t));
-                                if (fetch_weather_for_location(next) == 0) {
-                                    g_current_location = next;
-                                } else if (load_weather_from_cache(next) == 0) {
-                                    g_current_location = next;
-                                } else {
-                                    pakkit_message("Could not load weather.\nCheck connection and try again.", "OK");
-                                }
-                            } else if (load_weather_from_cache(next) == 0) {
-                                g_current_location = next;
-                            } else {
-                                pakkit_message("No WiFi and no cached data\nfor this location.", "OK");
-                            }
-                            scroll = (pakkit_scroll_state){0};
-                        }
-                        break;
                     case CAT_BTN_RIGHT:
                         if (!ev.repeated && g_location_count > 1) {
-                            int next = g_current_location + 1;
-                            if (next >= g_location_count) next = 0;
-                            /* Try network fetch first, fall back to cache */
-                            if (check_wifi()) {
-                                free_weather_textures(&g_weather_cache[next]);
-                                memset(&g_weather_cache[next], 0, sizeof(weather_data_t));
-                                if (fetch_weather_for_location(next) == 0) {
-                                    g_current_location = next;
-                                } else if (load_weather_from_cache(next) == 0) {
-                                    g_current_location = next;
-                                } else {
-                                    pakkit_message("Could not load weather.\nCheck connection and try again.", "OK");
-                                }
-                            } else if (load_weather_from_cache(next) == 0) {
-                                g_current_location = next;
-                            } else {
-                                pakkit_message("No WiFi and no cached data\nfor this location.", "OK");
-                            }
-                            scroll = (pakkit_scroll_state){0};
+                            int next = (ev.button == CAT_BTN_LEFT)
+                                ? (g_current_location - 1 + g_location_count) % g_location_count
+                                : (g_current_location + 1) % g_location_count;
+                            /* Switch instantly to cached data, refresh in the
+                               background (no blocking network call on input). */
+                            g_current_location = next;
+                            pthread_mutex_lock(&g_data_lock);
+                            if (!g_weather_cache[next].valid)
+                                load_weather_from_cache(next);
+                            pthread_mutex_unlock(&g_data_lock);
+                            request_refresh(next);
+                            scroll = (nb_scroll_state){0};
                         }
                         break;
                     case CAT_BTN_UP:
-                        pakkit_scroll_handle_input(&scroll, -1, SCROLL_STEP);
+                        nb_scroll_handle_input(&scroll, -1, SCROLL_STEP);
                         break;
                     case CAT_BTN_DOWN:
-                        pakkit_scroll_handle_input(&scroll, 1, SCROLL_STEP);
+                        nb_scroll_handle_input(&scroll, 1, SCROLL_STEP);
                         break;
                     default:
                         break;
@@ -1554,7 +1780,16 @@ static void show_weather_screen(void) {
             }
         }
 
-        pakkit_scroll_animate(&scroll);
+        nb_scroll_animate(&scroll);
+
+        /* Snapshot the (possibly background-updated) weather under the lock so a
+           worker thread can't tear the struct mid-draw. */
+        weather_data_t wlocal;
+        pthread_mutex_lock(&g_data_lock);
+        wlocal = g_weather_cache[g_current_location];
+        pthread_mutex_unlock(&g_data_lock);
+        weather_data_t *weather = &wlocal;
+        int fetching = g_fetch_active;
 
         cat_clear_screen();
         cat_draw_background();
@@ -1563,19 +1798,21 @@ static void show_weather_screen(void) {
         int sh = cat_get_screen_height();
         int pad = CAT_DS(5);
 
-        TTF_Font *font_med   = cat_get_font(CAT_FONT_MEDIUM);
         TTF_Font *font_tiny  = cat_get_font(CAT_FONT_TINY);
 
         cat_theme *theme = cat_get_theme();
         cat_draw_color hint_color = theme->hint;
 
-        int hint_font_h = TTF_FontHeight(font_tiny);
-        int footer_h = hint_font_h + pad * 2;
+        /* Reserve the footer's real height so content never draws under the
+           hints and the scroll clamp can reach the bottom. With hints off
+           (Leaf's global setting), reserve only a small bottom margin. */
+        int footer_h = g_show_hints ? cat_get_footer_height() + pad : CAT_DS(8);
 
         /* Header line: location name (left) + dots (right) */
         /* Leaf-style tab band across the top, then a location subheader. */
         int y = draw_tab_band(active_page, pad * 2) + pad * 2;
 
+        TTF_Font *font_loc = nb_font(NB_SZ_LABEL);
         if (weather->valid) {
             char location_full[512];
             if (weather->region[0])
@@ -1592,23 +1829,29 @@ static void show_weather_screen(void) {
             } else {
                 snprintf(header_text, sizeof(header_text), "%s", location_full);
             }
-            cat_draw_text_ellipsized(font_med, header_text, pad * 3, y, hint_color, sw - pad * 6);
+            cat_draw_text_ellipsized(font_loc, header_text, pad * 3, y, theme->text, sw - pad * 6);
         } else {
-            cat_draw_text(font_med, "Nimbus", pad * 3, y, hint_color);
+            cat_draw_text(font_loc, "Nimbus", pad * 3, y, theme->text);
         }
 
-        y += TTF_FontHeight(font_med) + pad;
+        y += TTF_FontHeight(font_loc) + pad;
 
         /* Divider */
         cat_draw_rect(pad * 3, y, sw - pad * 6, 1, hint_color);
         y += pad;
 
-        /* Cached indicator — below divider, right-aligned */
-        if (weather->valid && weather->is_cached && weather->cached_time[0]) {
-            char cached_label[64];
-            snprintf(cached_label, sizeof(cached_label), "Cached %s", weather->cached_time);
-            int cached_w = cat_measure_text(font_tiny, cached_label);
-            cat_draw_text(font_tiny, cached_label, sw - cached_w - pad * 3, y, hint_color);
+        /* Status line — left-aligned so it's always on screen: a live "Updating"
+           while a background fetch runs, otherwise the cached-data age. */
+        char status_buf[64];
+        const char *status = NULL;
+        if (fetching) {
+            status = "Updating\xe2\x80\xa6";
+        } else if (weather->valid && weather->is_cached && weather->cached_time[0]) {
+            snprintf(status_buf, sizeof(status_buf), "Cached %s", weather->cached_time);
+            status = status_buf;
+        }
+        if (status) {
+            cat_draw_text(font_tiny, status, pad * 3, y, hint_color);
             y += TTF_FontHeight(font_tiny) + pad;
         }
 
@@ -1621,12 +1864,17 @@ static void show_weather_screen(void) {
 
         if (!weather->valid) {
             scroll.scroll_y = 0;
-            cat_draw_text(font_med, "No weather data", pad * 3,
-                         content_y + content_h / 3, hint_color);
-            TTF_Font *font_small = cat_get_font(CAT_FONT_SMALL);
-            cat_draw_text(font_small, "Press Y for settings",
-                         pad * 3, content_y + content_h / 3 + TTF_FontHeight(font_med) + pad,
-                         hint_color);
+            const char *msg = fetching ? "Fetching weather\xe2\x80\xa6" : "No weather data";
+            TTF_Font *f_big = nb_font(NB_SZ_COND);
+            int mw = cat_measure_text(f_big, msg);
+            cat_draw_text(f_big, msg, (sw - mw) / 2, content_y + content_h / 3, theme->text);
+            if (!fetching) {
+                TTF_Font *f_small = nb_font(NB_SZ_LABEL);
+                const char *hint = "Press Y for Settings";
+                int hw = cat_measure_text(f_small, hint);
+                cat_draw_text(f_small, hint, (sw - hw) / 2,
+                              content_y + content_h / 3 + TTF_FontHeight(f_big) + pad, hint_color);
+            }
         } else {
             int total_h = 0;
             switch (active_page) {
@@ -1645,28 +1893,27 @@ static void show_weather_screen(void) {
             }
 
             /* Update cached max_scroll for next frame's input clamping */
-            pakkit_scroll_update(&scroll, total_h, content_h);
+            nb_scroll_update(&scroll, total_h, content_h);
         }
 
         SDL_RenderSetClipRect(cat__g.renderer, NULL);
 
-        /* Hints */
-
-        if (g_location_count > 1) {
-            pakkit_hint hints[] = {
-                {.button = "B",.label = "Quit" },
-                {.button = "L1/R1",.label = "View" },
-                {.button = "L/R",.label = "City" },
-                {.button = "Y",.label = "Menu" },
+        /* Hints — honor Leaf's global "Show Hints" setting. */
+        if (g_show_hints && g_location_count > 1) {
+            cat_footer_item hints[] = {
+                { .button = CAT_BTN_B, .label = "Quit" },
+                { .button = CAT_BTN_NONE, .label = "View", .button_text = "L1/R1" },
+                { .button = CAT_BTN_NONE, .label = "City", .button_text = "L/R" },
+                { .button = CAT_BTN_Y, .label = "Menu" },
             };
-            pakkit_draw_hints(hints, 4);
-        } else {
-            pakkit_hint hints[] = {
-                {.button = "B",.label = "Quit" },
-                {.button = "L1/R1",.label = "View" },
-                {.button = "Y",.label = "Menu" },
+            cat_draw_footer(hints, 4);
+        } else if (g_show_hints) {
+            cat_footer_item hints[] = {
+                { .button = CAT_BTN_B, .label = "Quit" },
+                { .button = CAT_BTN_NONE, .label = "View", .button_text = "L1/R1" },
+                { .button = CAT_BTN_Y, .label = "Menu" },
             };
-            pakkit_draw_hints(hints, 3);
+            cat_draw_footer(hints, 3);
         }
 
         cat_present();
@@ -1703,6 +1950,9 @@ int main(int argc, char *argv[]) {
         curl_global_cleanup();
         return 1;
     }
+
+    /* Match Leaf's global hint visibility (Settings > "Show Hints"). */
+    g_show_hints = cat_hints_enabled_from_env();
 
     /* Inherit Leaf's active theme: the user's color scheme + the system font
        (Catastrophe resolves both from the Leaf appearance snapshot via CAT_FONT_PATH;
@@ -1760,38 +2010,17 @@ int main(int argc, char *argv[]) {
 
     g_current_location = get_home_index();
 
-    /* WiFi check with retry/continue + offline cache fallback */
-    if (!check_wifi()) {
-        /* Try loading from offline cache */
-        int has_cache = (load_weather_from_cache(g_current_location) == 0);
-
-        while (!check_wifi()) {
-            if (has_cache) {
-                int retry = pakkit_confirm(
-                    "No WiFi connection.\nCached weather data available.",
-                    "Retry", "Continue");
-                if (!retry) break; /* Continue with cached data */
-            } else {
-                int retry = pakkit_confirm(
-                    "No WiFi connection.\nNo cached data available.",
-                    "Retry", "Quit");
-                if (!retry) {
-                    cat_quit(); curl_global_cleanup(); return 0;
-                }
-            }
-        }
-
-        if (check_wifi()) {
-            /* WiFi came back — fetch fresh data */
-            fetch_weather_for_location(g_current_location);
-        }
-        /* else: continuing with cached data already loaded */
-    } else {
-        /* WiFi available — fetch normally */
-        fetch_weather_for_location(g_current_location);
-    }
+    /* Non-blocking startup: show last-known (cached) weather instantly, then
+       refresh in the background. No modal WiFi gate — if offline the screen
+       shows cached data or a "Fetching"/"No data" state and recovers on its own
+       once a refresh succeeds. */
+    load_weather_from_cache(g_current_location);
+    request_refresh(g_current_location);
 
     show_weather_screen();
+
+    /* Let any in-flight background fetch finish before tearing down curl/SDL. */
+    for (int i = 0; i < 300 && g_fetch_active; i++) SDL_Delay(10);
 
     for (int i = 0; i < g_location_count; i++)
         free_weather_textures(&g_weather_cache[i]);

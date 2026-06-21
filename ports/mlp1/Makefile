@@ -9,7 +9,7 @@ CATA     ?= /workspace/Catastrophe
 CJSON    ?= $(APP)/third_party/cjson
 OUT      := $(APP)/ports/mlp1/pak/bin/nimbus
 
-CFLAGS  := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -DPLATFORM_MLP1 \
+CFLAGS  := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -DPLATFORM_MLP1 \
            -I$(APP)/src -I$(CATA)/include -I$(CJSON) \
            -I$(SYSROOT)/usr/include -I$(SYSROOT)/usr/include/SDL2
 LDFLAGS := -L$(SYSROOT)/usr/lib -lSDL2 -lSDL2_ttf -lSDL2_image -lGLESv2 -lEGL \
