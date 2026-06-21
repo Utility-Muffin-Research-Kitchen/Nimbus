@@ -200,10 +200,14 @@ static pakkit_action nui__run_list(const char *title, const char *const *labels,
     if (visible < 1) visible = 1;
     int scroll = 0;
 
+    /* Render exactly the caller's hints (so lists like Locations control their
+       own footer); fall back to A/B only when none are supplied (e.g. menus). */
     pakkit_hint hints[8]; int hc = 0;
-    hints[hc++] = (pakkit_hint){ "A", "Select" };
-    hints[hc++] = (pakkit_hint){ "B", "Back" };
     for (int i = 0; i < extra_count && hc < 8; i++) hints[hc++] = extra_hints[i];
+    if (hc == 0) {
+        hints[hc++] = (pakkit_hint){ "A", "Select" };
+        hints[hc++] = (pakkit_hint){ "B", "Back" };
+    }
 
     for (;;) {
         cat_input_event ev;

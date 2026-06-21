@@ -1453,21 +1453,21 @@ static void show_weather_screen(void) {
                             scroll = (pakkit_scroll_state){0};
                         }
                         break;
-                    case CAT_BTN_LEFT:
+                    case CAT_BTN_L1:
                         if (!ev.repeated) {
                             active_page--;
                             if (active_page < 0) active_page = TAB_COUNT - 1;
                             scroll = (pakkit_scroll_state){0};
                         }
                         break;
-                    case CAT_BTN_RIGHT:
+                    case CAT_BTN_R1:
                         if (!ev.repeated) {
                             active_page++;
                             if (active_page >= TAB_COUNT) active_page = 0;
                             scroll = (pakkit_scroll_state){0};
                         }
                         break;
-                    case CAT_BTN_L1:
+                    case CAT_BTN_LEFT:
                         if (!ev.repeated && g_location_count > 1) {
                             int next = g_current_location - 1;
                             if (next < 0) next = g_location_count - 1;
@@ -1490,7 +1490,7 @@ static void show_weather_screen(void) {
                             scroll = (pakkit_scroll_state){0};
                         }
                         break;
-                    case CAT_BTN_R1:
+                    case CAT_BTN_RIGHT:
                         if (!ev.repeated && g_location_count > 1) {
                             int next = g_current_location + 1;
                             if (next >= g_location_count) next = 0;
@@ -1639,15 +1639,15 @@ static void show_weather_screen(void) {
         if (g_location_count > 1) {
             pakkit_hint hints[] = {
                 {.button = "B",.label = "Quit" },
-                {.button = "L/R",.label = "View" },
-                {.button = "L1/R1",.label = "City" },
+                {.button = "L1/R1",.label = "View" },
+                {.button = "L/R",.label = "City" },
                 {.button = "Y",.label = "Menu" },
             };
             pakkit_draw_hints(hints, 4);
         } else {
             pakkit_hint hints[] = {
                 {.button = "B",.label = "Quit" },
-                {.button = "L/R",.label = "View" },
+                {.button = "L1/R1",.label = "View" },
                 {.button = "Y",.label = "Menu" },
             };
             pakkit_draw_hints(hints, 3);
@@ -1688,10 +1688,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    cat_theme *theme = cat_get_theme();
-    theme->background = (cat_draw_color){DEFAULT_BG_R, DEFAULT_BG_G, DEFAULT_BG_B, 255};
-    theme->text       = (cat_draw_color){DEFAULT_TEXT_R, DEFAULT_TEXT_G, DEFAULT_TEXT_B, 255};
-    theme->hint       = (cat_draw_color){DEFAULT_HINT_R, DEFAULT_HINT_G, DEFAULT_HINT_B, 255};
+    /* Inherit Leaf's active theme: the user's color scheme + the system font
+       (Catastrophe resolves both from the Leaf appearance snapshot via CAT_FONT_PATH;
+       no overrides here so Nimbus matches the rest of Leaf). */
 
     /* Splash screen */
     {
