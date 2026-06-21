@@ -12,6 +12,7 @@
 #define NIMBUS_UI_H
 
 #include "catastrophe.h"
+#include "catastrophe_widgets.h"   /* cat_keyboard */
 #include <SDL2/SDL.h>
 #include <string.h>
 
@@ -341,15 +342,15 @@ void pakkit_detail_screen(pakkit_detail_opts *opts) {
     }
 }
 
-/* Phase 1 stub: the on-screen keyboard is wired to Catastrophe's keyboard in a
-   later phase (PLAN.md). For now it cancels so location-search no-ops cleanly. */
+/* On-screen text entry via Catastrophe's keyboard. Returns CAT_OK on confirm
+   (result->text filled), CAT_ERROR on cancel/failure. */
 int pakkit_keyboard(const char *initial_text, pakkit_keyboard_opts *opts, pakkit_keyboard_result *result) {
-    (void)opts;
-    if (result) {
-        result->text[0] = '\0';
-        if (initial_text) snprintf(result->text, sizeof(result->text), "%s", initial_text);
-    }
-    return -1; /* cancelled — TODO: Catastrophe on-screen keyboard */
+    cat_keyboard_result kr;
+    kr.text[0] = '\0';
+    const char *help = (opts && opts->prompt) ? opts->prompt : "Enter text";
+    int rc = cat_keyboard(initial_text ? initial_text : "", help, CAT_KB_GENERAL, &kr);
+    if (result) snprintf(result->text, sizeof(result->text), "%s", kr.text);
+    return rc;
 }
 
 #endif /* NIMBUS_UI_IMPLEMENTATION */

@@ -860,8 +860,59 @@ typedef struct {
 } search_result_t;
 
 static int search_locations(const char *query, search_result_t *results, int max_results) {
-    (void)query; (void)results; (void)max_results;
-    return 0; /* Phase 1 stub: keyless Open-Meteo geocoding lands in Phase 2 (PLAN.md). */
+    if (!query || !query[0]) return 0;
+
+    /* URL-encode the query (alnum + a few safe chars pass; others -> %XX). */
+    char enc[256]; size_t ei = 0;
+    for (const char *p = query; *p && ei + 4 < sizeof(enc); p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+            enc[ei++] = (char)c;
+        } else {
+            static const char *hex = "0123456789ABCDEF";
+            enc[ei++] = '%'; enc[ei++] = hex[c >> 4]; enc[ei++] = hex[c & 15];
+        }
+    }
+    enc[ei] = '\0';
+
+    char url[MAX_URL];
+    snprintf(url, sizeof(url),
+        "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=%d&language=en&format=json",
+        enc, max_results > 0 ? max_results : 10);
+
+    pakkit_loading("Searching...");
+    fetch_buf_t buf;
+    if (fetch_url(url, &buf) != 0) return 0;
+    cJSON *root = cJSON_Parse(buf.data);
+    free(buf.data);
+    if (!root) return 0;
+
+    int count = 0;
+    cJSON *arr = cJSON_GetObjectItem(root, "results");
+    if (arr && cJSON_IsArray(arr)) {
+        int n = cJSON_GetArraySize(arr);
+        for (int i = 0; i < n && count < max_results; i++) {
+            cJSON *it = cJSON_GetArrayItem(arr, i);
+            if (!it) continue;
+            search_result_t *r = &results[count];
+            memset(r, 0, sizeof(*r));
+            cJSON *nm = cJSON_GetObjectItem(it, "name");
+            cJSON *a1 = cJSON_GetObjectItem(it, "admin1");
+            cJSON *co = cJSON_GetObjectItem(it, "country");
+            cJSON *la = cJSON_GetObjectItem(it, "latitude");
+            cJSON *lo = cJSON_GetObjectItem(it, "longitude");
+            if (nm && cJSON_IsString(nm)) snprintf(r->name, sizeof(r->name), "%s", nm->valuestring);
+            if (a1 && cJSON_IsString(a1)) snprintf(r->region, sizeof(r->region), "%s", a1->valuestring);
+            if (co && cJSON_IsString(co)) snprintf(r->country, sizeof(r->country), "%s", co->valuestring);
+            if (la && cJSON_IsNumber(la)) r->lat = la->valuedouble;
+            if (lo && cJSON_IsNumber(lo)) r->lon = lo->valuedouble;
+            r->id = 0;
+            count++;
+        }
+    }
+    cJSON_Delete(root);
+    return count;
 }
 
 static int search_and_add_location(void) {
