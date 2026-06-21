@@ -30,7 +30,7 @@
  * Constants
  * ----------------------------------------------------------------------- */
 
-#define NIMBUS_VERSION   "1.0.0"
+#define NIMBUS_VERSION   "0.1.0"
 #define MAX_PATH_LEN     1280
 #define MAX_LOCATION     256
 #define MAX_LINE         512
@@ -830,16 +830,16 @@ static void show_about(void) {
     pakkit_info_pair info[] = {
         {.key = "Version",.value = NIMBUS_VERSION },
         {.key = "Platform",.value = CAT_PLATFORM_NAME },
-        {.key = "UI",.value = "PakKit / Apostrophe" },
-        {.key = "Data",.value = "WeatherAPI.com" },
+        {.key = "UI",.value = "Catastrophe" },
+        {.key = "Data",.value = "Open-Meteo" },
         {.key = "License",.value = "MIT" },
     };
     const char *credits[] = {
         "Nimbus by Eric Reinsmidt",
-        "Built with PakKit and Apostrophe",
-        "For NextUI by LoveRetro",
+        "Built with Catastrophe for Leaf",
+        "Weather data by Open-Meteo (CC-BY 4.0)",
     };
-    pakkit_detail_opts opts = {.title = "Nimbus",.subtitle = "Weather app for NextUI",.info = info,.info_count = 5,.credits = credits,.credit_count = 3,
+    pakkit_detail_opts opts = {.title = "Nimbus",.subtitle = "Weather app for Leaf",.info = info,.info_count = 5,.credits = credits,.credit_count = 3,
     };
     pakkit_detail_screen(&opts);
 }
