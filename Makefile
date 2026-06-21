@@ -29,7 +29,8 @@ native:
 	cc $(CFLAGS_COMMON) -O0 -g -DPLATFORM_MAC \
 		$(shell pkg-config --cflags sdl2 SDL2_ttf SDL2_image) \
 		-o $(NATIVE_BIN) src/main.c \
-		$(shell pkg-config --libs sdl2 SDL2_ttf SDL2_image) -lcurl -lm -lpthread
+		$(shell pkg-config --libs sdl2 SDL2_ttf SDL2_image) -lcurl -lm -lpthread \
+		-framework Cocoa
 
 run-native: native
 	./$(NATIVE_BIN)

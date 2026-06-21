@@ -21,6 +21,10 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Nimbus UI widgets reimplemented on Catastrophe (replaces PakKit). */
+#define NIMBUS_UI_IMPLEMENTATION
+#include "nimbus_ui.h"
+
 /* -----------------------------------------------------------------------
  * Constants
  * ----------------------------------------------------------------------- */
@@ -810,68 +814,27 @@ static int load_weather_from_cache(int loc_idx) {
 }
 
 static int fetch_weather_for_location(int loc_idx) {
-    if (g_api_key[0] == '\0' || loc_idx < 0 || loc_idx >= g_location_count) return -1;
-
+    if (loc_idx < 0 || loc_idx >= g_location_count) return -1;
     location_t *loc = &g_locations[loc_idx];
     weather_data_t *weather = &g_weather_cache[loc_idx];
 
-    char url[MAX_URL];
-    if (loc->id > 0)
-        snprintf(url, sizeof(url),
-                 "https://api.weatherapi.com/v1/forecast.json?key=%s&q=id:%d&days=3&aqi=no",
-                 g_api_key, loc->id);
-    else if (loc->lat_lon[0])
-        snprintf(url, sizeof(url),
-                 "https://api.weatherapi.com/v1/forecast.json?key=%s&q=%s&days=3&aqi=no",
-                 g_api_key, loc->lat_lon);
-    else
-        snprintf(url, sizeof(url),
-                 "https://api.weatherapi.com/v1/forecast.json?key=%s&q=%s&days=3&aqi=no",
-                 g_api_key, loc->name);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg), "Fetching weather for\n%s...", loc->name);
-
-    int sw = cat_get_screen_width();
-    int sh = cat_get_screen_height();
-    TTF_Font *font_small = cat_get_font(CAT_FONT_SMALL);
-    cat_draw_color text_color = cat_get_theme()->text;
-    int max_w = sw - CAT_DS(5) * 8;
-    int msg_h = cat_measure_wrapped_text_height(font_small, msg, max_w);
-    cat_clear_screen();
-    cat_draw_background();
-    cat_draw_text_wrapped(font_small, msg, CAT_DS(5) * 4, (sh - msg_h) / 2,
-                         max_w, text_color, CAT_ALIGN_CENTER);
-    cat_present();
-
-    fetch_buf_t buf;
-    int rc = fetch_url(url, &buf);
-    if (rc != 0) return -1;
-
-    rc = parse_weather_data(buf.data, weather);
-    if (rc != 0) { free(buf.data); return rc; }
-
-    /* Save raw JSON to offline cache */
-    save_weather_json(loc_idx, buf.data);
-    free(buf.data);
-
+    /* Phase 1 stub: canned data so the UI runs without a network backend.
+       Replaced by the Open-Meteo fetch + parse in Phase 2 (see PLAN.md). */
+    memset(weather, 0, sizeof(*weather));
+    snprintf(weather->location_name, sizeof(weather->location_name), "%s",
+             loc->name[0] ? loc->name : "Sample City");
+    weather->temp_f = 72;       weather->temp_c = 22;
+    weather->feels_like_f = 70; weather->feels_like_c = 21;
+    weather->humidity = 55;     weather->cloud = 40;     weather->uv = 3;
+    weather->wind_mph = 8;      weather->wind_kph = 13;
+    snprintf(weather->wind_dir, sizeof(weather->wind_dir), "NW");
+    snprintf(weather->condition_text, sizeof(weather->condition_text), "Partly cloudy");
+    weather->is_day = 1;
+    weather->forecast_count = 0;
+    weather->hour_count = 0;
+    weather->valid = 1;
     weather->is_cached = 0;
     weather->cached_time[0] = '\0';
-
-    load_weather_icons(weather, 0);
-
-    if (strcmp(loc->name, "auto:ip") == 0 && weather->location_name[0]) {
-        if (weather->region[0])
-            snprintf(loc->name, MAX_LOCATION, "%s, %s",
-                     weather->location_name, weather->region);
-        else
-            snprintf(loc->name, MAX_LOCATION, "%s", weather->location_name);
-        snprintf(loc->lat_lon, sizeof(loc->lat_lon), "%.4f,%.4f",
-                 weather->loc_lat, weather->loc_lon);
-        loc->id = 0;
-        save_locations();
-    }
-
     return 0;
 }
 
@@ -913,47 +876,8 @@ typedef struct {
 } search_result_t;
 
 static int search_locations(const char *query, search_result_t *results, int max_results) {
-    if (g_api_key[0] == '\0' || !query || !query[0]) return 0;
-    char url[MAX_URL];
-    char encoded[256] = {0};
-    const char *src = query;
-    char *dst = encoded, *end = encoded + sizeof(encoded) - 4;
-    while (*src && dst < end) {
-        if (*src == ' ') { *dst++ = '%'; *dst++ = '2'; *dst++ = '0'; }
-        else { *dst++ = *src; }
-        src++;
-    }
-    *dst = '\0';
-    snprintf(url, sizeof(url),
-             "https://api.weatherapi.com/v1/search.json?key=%s&q=%s",
-             g_api_key, encoded);
-    pakkit_loading("Searching...");
-    fetch_buf_t buf;
-    int rc = fetch_url(url, &buf);
-    if (rc != 0) return 0;
-    cJSON *root = cJSON_Parse(buf.data);
-    free(buf.data);
-    if (!root || !cJSON_IsArray(root)) { cJSON_Delete(root); return 0; }
-    int count = 0, arr_size = cJSON_GetArraySize(root);
-    for (int i = 0; i < arr_size && count < max_results; i++) {
-        cJSON *item = cJSON_GetArrayItem(root, i);
-        if (!item) continue;
-        cJSON *v;
-        search_result_t *r = &results[count];
-        memset(r, 0, sizeof(*r));
-        if ((v = cJSON_GetObjectItem(item, "id")))    r->id = v->valueint;
-        if ((v = cJSON_GetObjectItem(item, "name")) && v->valuestring)
-            strncpy(r->name, v->valuestring, MAX_LOCATION - 1);
-        if ((v = cJSON_GetObjectItem(item, "region")) && v->valuestring)
-            strncpy(r->region, v->valuestring, MAX_LOCATION - 1);
-        if ((v = cJSON_GetObjectItem(item, "country")) && v->valuestring)
-            strncpy(r->country, v->valuestring, MAX_LOCATION - 1);
-        if ((v = cJSON_GetObjectItem(item, "lat"))) r->lat = v->valuedouble;
-        if ((v = cJSON_GetObjectItem(item, "lon"))) r->lon = v->valuedouble;
-        if (r->name[0]) count++;
-    }
-    cJSON_Delete(root);
-    return count;
+    (void)query; (void)results; (void)max_results;
+    return 0; /* Phase 1 stub: keyless Open-Meteo geocoding lands in Phase 2 (PLAN.md). */
 }
 
 static int search_and_add_location(void) {
@@ -1087,17 +1011,15 @@ static void show_settings(void) {
         pakkit_menu_item items[] = {
             {.label = units_label },
             {.label = "Locations" },
-            {.label = "Change API Key" },
             {.label = "About" },
         };
         pakkit_menu_result result;
-        int rc = pakkit_menu("Settings", items, 4, &result);
-        if (rc != CAT_OK) return;
+        pakkit_menu("Settings", items, 3, &result);
+        if (result.selected_index < 0) return;   /* B cancels out of Settings */
         switch (result.selected_index) {
             case 0: g_settings.use_fahrenheit = !g_settings.use_fahrenheit; settings_save(); break;
             case 1: show_locations(); break;
-            case 2: show_api_key_setup(); break;
-            case 3: show_about(); break;
+            case 2: show_about(); break;
         }
     }
 }
@@ -1723,10 +1645,10 @@ int main(int argc, char *argv[]) {
         if (lf) fclose(lf);
     }
 
-    cat_config cfg = {.window_title       = "Nimbus",.log_path           = log_path,.is_nextui          = CAT_PLATFORM_IS_DEVICE,.disable_background = true,
+    cat_config cfg = {.window_title       = "Nimbus",.log_path           = log_path,.disable_background = true,
     };
     if (cat_init(&cfg) != CAT_OK) {
-        fprintf(stderr, "Failed to initialise Apostrophe\n");
+        fprintf(stderr, "Failed to initialise Catastrophe\n");
         curl_global_cleanup();
         return 1;
     }
@@ -1779,12 +1701,7 @@ int main(int argc, char *argv[]) {
     cat_log("=== Nimbus v%s starting ===", NIMBUS_VERSION);
     memset(g_weather_cache, 0, sizeof(g_weather_cache));
 
-    if (load_api_key() != 0) {
-        if (show_api_key_setup() != 0) {
-            cat_quit(); curl_global_cleanup(); return 0;
-        }
-    }
-
+    /* No API key needed (Open-Meteo is keyless) — go straight to locations. */
     if (load_locations() != 0) {
         g_locations[0] = (location_t){.is_home = 1 };
         snprintf(g_locations[0].name, MAX_LOCATION, "auto:ip");
