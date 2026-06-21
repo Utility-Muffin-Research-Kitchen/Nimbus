@@ -1,0 +1,10 @@
+# build output
+build/
+dist/
+output/
+workdir/
+*.pak
+*.pak.zip
+
+# macOS
+.DS_Store
