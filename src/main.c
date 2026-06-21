@@ -1423,6 +1423,35 @@ static void draw_page_dots(int count, int active, int x, int y) {
  * Screens: Weather display with page dots
  * ----------------------------------------------------------------------- */
 
+/* Leaf-style tab band: the four weather tabs in a centered row, the active one
+   in a theme highlight pill (matches the launcher's tab look). Returns the y
+   just below the band. */
+static int draw_tab_band(int active, int top) {
+    static const char *labels[TAB_COUNT] = { "Current", "Forecast", "Hourly", "Astro" };
+    cat_theme *th = cat_get_theme();
+    TTF_Font *f = cat_get_font(CAT_FONT_MEDIUM);
+    int sw = cat_get_screen_width();
+    int xpad = CAT_DS(8), gap = CAT_DS(8);
+    int fh = TTF_FontHeight(f);
+    int pill_h = fh + CAT_DS(8);
+
+    int widths[TAB_COUNT], total = gap * (TAB_COUNT - 1);
+    for (int i = 0; i < TAB_COUNT; i++) {
+        widths[i] = cat_measure_text(f, labels[i]) + xpad * 2;
+        total += widths[i];
+    }
+    int x = (sw - total) / 2;
+    for (int i = 0; i < TAB_COUNT; i++) {
+        bool sel = (i == active);
+        if (sel)
+            cat_draw_rounded_rect(x, top, widths[i], pill_h, pill_h / 2, th->highlight);
+        cat_draw_text(f, labels[i], x + xpad, top + (pill_h - fh) / 2,
+                      sel ? th->highlighted_text : th->hint);
+        x += widths[i] + gap;
+    }
+    return top + pill_h;
+}
+
 static void show_weather_screen(void) {
     int running = 1;
     pakkit_scroll_state scroll = {0};
@@ -1544,7 +1573,8 @@ static void show_weather_screen(void) {
         int footer_h = hint_font_h + pad * 2;
 
         /* Header line: location name (left) + dots (right) */
-        int y = pad * 3;
+        /* Leaf-style tab band across the top, then a location subheader. */
+        int y = draw_tab_band(active_page, pad * 2) + pad * 2;
 
         if (weather->valid) {
             char location_full[512];
@@ -1562,26 +1592,12 @@ static void show_weather_screen(void) {
             } else {
                 snprintf(header_text, sizeof(header_text), "%s", location_full);
             }
-
-            /* Ellipsize header to leave room for dots */
-            int dot_r = CAT_DS(3);
-            int dot_spacing = dot_r * 4;
-            int dots_total_w = (TAB_COUNT - 1) * dot_spacing + dot_r * 2;
-            int max_header_w = sw - pad * 3 - dots_total_w - pad * 3;
-            cat_draw_text_ellipsized(font_med, header_text, pad * 3, y, hint_color, max_header_w);
+            cat_draw_text_ellipsized(font_med, header_text, pad * 3, y, hint_color, sw - pad * 6);
         } else {
             cat_draw_text(font_med, "Nimbus", pad * 3, y, hint_color);
         }
 
-        /* Dots right-aligned on same line */
-        int dot_r = CAT_DS(3);
-        int dot_spacing = dot_r * 4;
-        int dots_total_w = (TAB_COUNT - 1) * dot_spacing;
-        int dots_x = sw - pad * 3 - dots_total_w;
-        int dots_y = y + (TTF_FontHeight(font_med) - dot_r * 2) / 2;
-        draw_page_dots(TAB_COUNT, active_page, dots_x, dots_y);
-
-        y += TTF_FontHeight(font_med) + pad * 2;
+        y += TTF_FontHeight(font_med) + pad;
 
         /* Divider */
         cat_draw_rect(pad * 3, y, sw - pad * 6, 1, hint_color);
