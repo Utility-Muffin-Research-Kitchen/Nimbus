@@ -1462,7 +1462,9 @@ static void draw_tab_current(weather_data_t *weather, int content_y, int content
     cat_draw_color hint_color = theme->hint;
     cat_draw_color glyph_color = theme->highlight;
 
-    int y = content_y - scroll_y + CAT_DS(6);
+    /* With footer hints on, start in the temperature's empty ascent so the
+       hero leaves room for the stat labels above the footer. */
+    int y = content_y - scroll_y + (g_show_hints ? -CAT_DS(14) : CAT_DS(6));
 
     /* Glyph + temperature, centered together on one row. */
     char temp_str[32];
@@ -1530,10 +1532,13 @@ static void draw_tab_current(weather_data_t *weather, int content_y, int content
                  weather->wind_gust_kph, weather->pressure_hpa, weather->dew_point_c);
 
     /* Pin the stat row + details line to the bottom of the content area so it's
-       always fully on screen under the big hero (no hidden scroll). */
+       always fully on screen under the big hero (no hidden scroll). The details
+       line is the first thing to go when the footer leaves too little room. */
     TTF_Font *f_det = nb_font(NB_SZ_DETAIL);
     int val_h = TTF_FontHeight(f_val), lbl_h = TTF_FontHeight(f_cap), det_h = TTF_FontHeight(f_det);
     int block_h = val_h + lbl_h + CAT_DS(4) + det_h;
+    int show_details = y + CAT_DS(8) + block_h <= content_y + content_h;
+    if (!show_details) block_h = val_h + lbl_h;
     int stat_y = content_y + content_h - block_h - CAT_DS(6);
     if (stat_y < y + CAT_DS(8)) stat_y = y + CAT_DS(8);  /* never overlap the hero */
 
@@ -1544,7 +1549,8 @@ static void draw_tab_current(weather_data_t *weather, int content_y, int content
         draw_centered_text(f_val, stats[i].value[0] ? stats[i].value : "\xe2\x80\x94", scx, stat_y, text_color);
         draw_centered_text(f_cap, stats[i].label, scx, stat_y + val_h, hint_color);
     }
-    draw_centered_text(f_det, details, cx, stat_y + val_h + lbl_h + CAT_DS(4), hint_color);
+    if (show_details)
+        draw_centered_text(f_det, details, cx, stat_y + val_h + lbl_h + CAT_DS(4), hint_color);
 
     /* Content fits the viewport — no scrolling on Current. */
     *total_h = content_h;
